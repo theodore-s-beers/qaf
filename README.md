@@ -23,6 +23,8 @@ Each prompt continues the conversation. `/clear` clears conversation history wit
 
 At the prompt, Left/Right move the cursor, Up/Down recall earlier inputs from this session, and Ctrl-C discards the current line. Input history is kept in memory only; approval answers are not included.
 
+Responses use basic Markdown formatting in supported terminals, with prose wrapped to the terminal width. Code blocks retain their contents; tables remain Markdown. Redirected output and `NO_COLOR` retain the original Markdown.
+
 Login opens your browser to authorize qaf to use your ChatGPT plan. Use `status` to view saved accounts and `logout` to sign out. To use another account or workspace, pass `--account LABEL` when logging in and running tasks.
 
 Credentials are stored with owner-only permissions in `~/.config/qaf/auth.json` (or `$XDG_CONFIG_HOME/qaf/auth.json`). Keep this directory out of source control.
@@ -45,6 +47,7 @@ Run `cargo run -- --help` for options.
 - `src/terminal.rs`: terminal input, output, and human approvals.
 - `src/auth.rs`: ChatGPT login, credentials, and token refresh.
 - `src/agent.rs`: conversation history and the model/tool loop.
+- `src/render.rs`: terminal Markdown presentation.
 - `src/model.rs`: OpenAI Responses API integration.
 - `src/tools.rs`: file and shell tools.
 - `src/permissions.rs`: access requests and approval decisions.

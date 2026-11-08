@@ -3,6 +3,7 @@ mod auth;
 mod model;
 mod permissions;
 mod preferences;
+mod render;
 mod sandbox;
 mod terminal;
 mod tools;
@@ -235,7 +236,7 @@ async fn task(
         result = agent.run(model, tools, transcript, max_turns, &terminal::Human, |event| {
             match event {
                 agent::Event::Text(text) => {
-                    println!("\n{text}");
+                    println!("\n{}", render::response(text));
                     showing_tools = false;
                 }
                 agent::Event::Tool(name) => {

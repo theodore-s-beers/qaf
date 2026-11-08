@@ -35,6 +35,9 @@ tokio = { version = "1", features = [
   "sync",
 ] }
 rustyline = { version = "19.0.0", default-features = false }
+pulldown-cmark = { version = "0.13.6", default-features = false }
+textwrap = { version = "0.16.4", default-features = false, features = ["unicode-width"] }
+terminal_size = "0.4.4"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["test-util"] }
