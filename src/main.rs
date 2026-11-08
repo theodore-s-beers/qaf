@@ -236,11 +236,11 @@ async fn task(
                     println!("\n{}", render::response(text));
                     showing_tools = false;
                 }
-                agent::Event::Tool(name) => {
+                agent::Event::Tool(tool) => {
                     if !showing_tools {
                         eprintln!();
                     }
-                    terminal::status(format_args!("Running {name}…"));
+                    terminal::status(format_args!("{}", terminal::tool_preview(tool)));
                     showing_tools = true;
                 }
             }

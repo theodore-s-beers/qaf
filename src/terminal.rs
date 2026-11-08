@@ -20,6 +20,37 @@ pub fn status(message: std::fmt::Arguments<'_>) {
     }
 }
 
+/// A bounded display preview; execution and approval retain the full arguments.
+pub fn tool_preview(tool: &crate::tools::Tool) -> String {
+    use crate::tools::Tool;
+    let (verb, detail) = match tool {
+        Tool::ReadFile { path } => ("Reading", path),
+        Tool::WriteFile { path, .. } => ("Writing", path),
+        Tool::EditFile { path, .. } => ("Editing", path),
+        Tool::Shell { command } => ("Running:", command),
+    };
+    let single_line = detail.split_whitespace().collect::<Vec<_>>().join(" ");
+    // Escape controls before printing model-provided paths or commands.
+    let safe: String = single_line
+        .chars()
+        .map(|character| {
+            if character.is_control() {
+                character.escape_debug().to_string()
+            } else {
+                character.to_string()
+            }
+        })
+        .collect();
+    let mut characters = safe.chars();
+    let preview: String = characters.by_ref().take(100).collect();
+    let suffix = if characters.next().is_some() {
+        "…"
+    } else {
+        ""
+    };
+    format!("{verb} {preview}{suffix}")
+}
+
 pub enum Input {
     Line(String),
     Interrupted,
@@ -204,6 +235,35 @@ impl Terminal {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tool_previews_are_bounded_single_line_and_escape_controls() {
+        use crate::tools::Tool;
+        assert_eq!(
+            tool_preview(&Tool::ReadFile {
+                path: "src/main.rs".into()
+            }),
+            "Reading src/main.rs"
+        );
+        assert_eq!(
+            tool_preview(&Tool::Shell {
+                command: "cargo test\n\t&& echo \x1b[31m".into()
+            }),
+            "Running: cargo test && echo \\u{1b}[31m"
+        );
+        let command = "界".repeat(100);
+        assert_eq!(
+            tool_preview(&Tool::Shell {
+                command: command.clone()
+            }),
+            format!("Running: {command}")
+        );
+        let command = "界".repeat(150);
+        assert_eq!(
+            tool_preview(&Tool::Shell { command }),
+            format!("Running: {}…", "界".repeat(100))
+        );
+    }
 
     #[tokio::test]
     async fn cancelled_reads_do_not_steal_later_input_and_long_lines_are_drained() {

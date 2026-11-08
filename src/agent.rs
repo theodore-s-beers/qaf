@@ -9,7 +9,7 @@ use serde_json::{Value, json};
 
 pub enum Event<'a> {
     Text(&'a str),
-    Tool(&'a str),
+    Tool(&'a crate::tools::Tool),
 }
 
 pub struct Agent {
@@ -100,7 +100,7 @@ impl Agent {
                         };
                         match decision {
                             Decision::AllowOnce => {
-                                emit(Event::Tool(&call.name));
+                                emit(Event::Tool(&request.tool));
                                 tools.run(&request).await
                             }
                             Decision::Deny => {
