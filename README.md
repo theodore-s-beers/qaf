@@ -13,10 +13,10 @@ cargo run -- --model YOUR_MODEL -C /path/to/project \
   "Fix the failing test and explain the change"
 ```
 
-Omit the task to start an interactive session:
+qaf remembers the model selected with `--model` or `OPENAI_MODEL` in `preferences.json` alongside the credentials. Selection order is `--model`, `OPENAI_MODEL`, then the saved choice. Omit the task to start an interactive session:
 
 ```sh
-cargo run -- --model YOUR_MODEL -C /path/to/project
+cargo run -- -C /path/to/project
 ```
 
 Each prompt continues the conversation. `/clear` clears conversation history without undoing file changes; `/exit` or Ctrl-D exits. Ctrl-C during a task stops it and returns to the prompt. The `--max-turns` limit applies separately to each task. Sessions stay in memory and cannot be resumed after exit; use `/clear` if the conversation exceeds the model's context limit.
@@ -44,6 +44,7 @@ Run `cargo run -- --help` for options.
 - `src/model.rs`: OpenAI Responses API integration.
 - `src/tools.rs`: file and shell tools.
 - `src/permissions.rs`: access requests and approval decisions.
+- `src/preferences.rs`: saved model selection.
 - `src/sandbox.rs`: macOS and Linux sandbox launchers.
 - `src/transcript.rs`: JSONL recording.
 

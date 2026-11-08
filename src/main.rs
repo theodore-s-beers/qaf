@@ -2,6 +2,7 @@ mod agent;
 mod auth;
 mod model;
 mod permissions;
+mod preferences;
 mod sandbox;
 mod terminal;
 mod tools;
@@ -32,6 +33,7 @@ struct Args {
     /// Credential directory (defaults to ~/.config/qaf or $`XDG_CONFIG_HOME/qaf`)
     #[arg(long, global = true, env = "QAF_AUTH_DIR")]
     auth_dir: Option<PathBuf>,
+    /// Model to use and remember (defaults to the last selected model)
     #[arg(long, env = "OPENAI_MODEL")]
     model: Option<String>,
     #[arg(short = 'C', long, default_value = ".")]
@@ -118,9 +120,8 @@ async fn run() -> Result<()> {
     } else {
         None
     };
-    let model_name = args
-        .model
-        .context("choose --model or set OPENAI_MODEL; run qaf models for choices")?;
+    let preferences_path = store.directory().join("preferences.json");
+    let model_name = preferences::select_model(&preferences_path, args.model.as_deref())?;
     if args
         .prompt
         .as_ref()
@@ -147,6 +148,10 @@ async fn run() -> Result<()> {
         "start",
         &json!({"model": model_name, "account": args.account, "directory": tools.directory(), "max_turns": args.max_turns, "interactive": terminal.is_some()}),
     )?;
+    if args.model.is_some() {
+        preferences::remember_model(&preferences_path, &model_name)?;
+    }
+    eprintln!("Model: {model_name}");
     eprintln!("Transcript: {}", path.display());
     if let Some(prompt) = args.prompt {
         let mut agent = agent::Agent::new(&prompt);
