@@ -116,7 +116,7 @@ async fn run() -> Result<()> {
             std::io::stdin().is_terminal(),
             "interactive mode requires a terminal; pass a task as an argument instead"
         );
-        Some(terminal::Terminal::open().context("open interactive terminal")?)
+        Some(terminal::LineEditor::new().context("open interactive line editor")?)
     } else {
         None
     };
@@ -158,9 +158,9 @@ async fn run() -> Result<()> {
         task(&mut agent, &model, &tools, &mut transcript, args.max_turns)
             .await?
             .map_err(anyhow::Error::msg)?;
-    } else if let Some(terminal) = terminal {
+    } else if let Some(mut terminal) = terminal {
         interactive(
-            &terminal,
+            &mut terminal,
             &model,
             &tools,
             &mut transcript,
@@ -173,7 +173,7 @@ async fn run() -> Result<()> {
 }
 
 async fn interactive(
-    terminal: &terminal::Terminal,
+    terminal: &mut impl terminal::PromptReader,
     model: &impl model::Model,
     tools: &tools::Tools,
     transcript: &mut transcript::Transcript,
@@ -185,15 +185,11 @@ async fn interactive(
     );
     let mut agent: Option<agent::Agent> = None;
     loop {
-        terminal.write("\nqaf> ").await?;
-        let line = tokio::select! {
-            line = terminal.read_line(1024 * 1024) => line?,
-            signal = tokio::signal::ctrl_c() => {
-                signal.context("listen for Ctrl-C")?;
-                continue;
-            }
+        let line = match terminal.read_prompt().await? {
+            terminal::Input::Line(line) => line,
+            terminal::Input::Interrupted => continue,
+            terminal::Input::Eof => return Ok(()),
         };
-        let Some(line) = line else { return Ok(()) };
         let prompt = line.trim();
         match prompt {
             "" => continue,
@@ -255,7 +251,7 @@ async fn task(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::{io::Write, sync::Mutex};
+    use std::{collections::VecDeque, sync::Mutex};
 
     #[tokio::test]
     async fn session_continues_after_errors_and_clear_resets_context() {
@@ -280,16 +276,30 @@ mod tests {
                 })
             }
         }
+        struct Prompts(VecDeque<terminal::Input>);
+        impl terminal::PromptReader for Prompts {
+            fn read_prompt(
+                &mut self,
+            ) -> impl std::future::Future<Output = Result<terminal::Input>> + Send {
+                std::future::ready(Ok(self.0.pop_front().unwrap_or(terminal::Input::Eof)))
+            }
+        }
         let root = tempfile::tempdir().unwrap();
         let tools = tools::Tools::for_test(root.path(), Duration::from_secs(1)).unwrap();
         let path = root.path().join("log");
         let mut transcript = transcript::Transcript::create(&path).unwrap();
         let model = Model(Mutex::new(Vec::new()));
-        let (terminal, mut user) = terminal::Terminal::pair();
-        user.write_all(b"first\nfollowup\n/clear\nthird\n/exit\n")
-            .unwrap();
+        let mut terminal = Prompts(VecDeque::from([
+            terminal::Input::Interrupted,
+            terminal::Input::Line("first".into()),
+            terminal::Input::Interrupted,
+            terminal::Input::Line("followup".into()),
+            terminal::Input::Line("/clear".into()),
+            terminal::Input::Line("third".into()),
+            terminal::Input::Line("/exit".into()),
+        ]));
         interactive(
-            &terminal,
+            &mut terminal,
             &model,
             &tools,
             &mut transcript,

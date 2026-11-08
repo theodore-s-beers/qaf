@@ -1,4 +1,5 @@
-use anyhow::{Result, ensure};
+use anyhow::{Context, Result, ensure};
+use rustyline::{Behavior, Config, DefaultEditor, error::ReadlineError};
 use std::{
     fs::{File, OpenOptions},
     io::{Read, Write},
@@ -6,7 +7,67 @@ use std::{
     time::Duration,
 };
 
-/// Nonblocking terminal I/O keeps both task input and approvals cancellable.
+pub enum Input {
+    Line(String),
+    Interrupted,
+    Eof,
+}
+
+pub trait PromptReader {
+    fn read_prompt(&mut self) -> impl std::future::Future<Output = Result<Input>> + Send;
+}
+
+pub struct LineEditor {
+    editor: Option<DefaultEditor>,
+}
+
+impl LineEditor {
+    pub fn new() -> Result<Self> {
+        let config = Config::builder()
+            .behavior(Behavior::PreferTerm)
+            .auto_add_history(true)
+            .build();
+        Ok(Self {
+            editor: Some(DefaultEditor::with_config(config)?),
+        })
+    }
+}
+
+impl PromptReader for LineEditor {
+    async fn read_prompt(&mut self) -> Result<Input> {
+        let mut editor = self
+            .editor
+            .take()
+            .context("line editor is already reading")?;
+        // Await this worker to completion: dropping a blocking readline would leave
+        // a competing terminal reader. Rustyline handles Ctrl-C while editing and
+        // restores terminal modes and signal handlers before tools or approvals run.
+        let (editor, result) = tokio::task::spawn_blocking(move || {
+            // Rustyline 19 polls its signal pipe when an external printer exists.
+            // Keep one alive so signals delivered to another runtime thread still
+            // wake readline; we don't use it to print task or approval output.
+            let result = match editor.create_external_printer() {
+                Ok(_signals) => editor.readline("qaf> "),
+                Err(error) => Err(error),
+            };
+            (editor, result)
+        })
+        .await
+        .context("line editor failed")?;
+        self.editor = Some(editor);
+        match result {
+            Ok(line) => Ok(Input::Line(line)),
+            Err(
+                ReadlineError::Interrupted
+                | ReadlineError::Signal(rustyline::error::Signal::Interrupt),
+            ) => Ok(Input::Interrupted),
+            Err(ReadlineError::Eof) => Ok(Input::Eof),
+            Err(error) => Err(error.into()),
+        }
+    }
+}
+
+/// Nonblocking terminal I/O keeps approval prompts cancellable.
 pub struct Terminal {
     file: File,
 }

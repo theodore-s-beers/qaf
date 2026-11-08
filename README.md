@@ -21,6 +21,8 @@ cargo run -- -C /path/to/project
 
 Each prompt continues the conversation. `/clear` clears conversation history without undoing file changes; `/exit` or Ctrl-D exits. Ctrl-C during a task stops it and returns to the prompt. The `--max-turns` limit applies separately to each task. Sessions stay in memory and cannot be resumed after exit; use `/clear` if the conversation exceeds the model's context limit.
 
+At the prompt, Left/Right move the cursor, Up/Down recall earlier inputs from this session, and Ctrl-C discards the current line. Input history is kept in memory only; approval answers are not included.
+
 Login opens your browser to authorize qaf to use your ChatGPT plan. Use `status` to view saved accounts and `logout` to sign out. To use another account or workspace, pass `--account LABEL` when logging in and running tasks.
 
 Credentials are stored with owner-only permissions in `~/.config/qaf/auth.json` (or `$XDG_CONFIG_HOME/qaf/auth.json`). Keep this directory out of source control.

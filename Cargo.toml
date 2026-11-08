@@ -34,6 +34,7 @@ tokio = { version = "1", features = [
   "net",
   "sync",
 ] }
+rustyline = { version = "19.0.0", default-features = false }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["test-util"] }
