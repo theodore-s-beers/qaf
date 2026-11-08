@@ -152,8 +152,8 @@ async fn run() -> Result<()> {
     if args.model.is_some() {
         preferences::remember_model(&preferences_path, &model_name)?;
     }
-    eprintln!("Model: {model_name}");
-    eprintln!("Transcript: {}", path.display());
+    terminal::status(format_args!("Model: {model_name}"));
+    terminal::status(format_args!("Transcript: {}", path.display()));
     if let Some(prompt) = args.prompt {
         let mut agent = agent::Agent::new(&prompt, &model_name);
         task(&mut agent, &model, &tools, &mut transcript, args.max_turns)
@@ -181,9 +181,9 @@ async fn interactive(
     max_turns: u32,
     model_name: &str,
 ) -> Result<()> {
-    eprintln!(
+    terminal::status(format_args!(
         "Enter a task. /clear starts fresh; /exit or Ctrl-D exits. Ctrl-C stops the current task."
-    );
+    ));
     let mut agent: Option<agent::Agent> = None;
     loop {
         eprintln!();
@@ -229,9 +229,6 @@ async fn task(
     max_turns: u32,
 ) -> Result<Result<(), String>> {
     let mut showing_tools = false;
-    let dim_tools = std::io::stderr().is_terminal()
-        && std::env::var_os("NO_COLOR").is_none_or(|value| value.is_empty())
-        && std::env::var_os("TERM").is_none_or(|value| value != "dumb");
     let result = tokio::select! {
         result = agent.run(model, tools, transcript, max_turns, &terminal::Human, |event| {
             match event {
@@ -243,11 +240,7 @@ async fn task(
                     if !showing_tools {
                         eprintln!();
                     }
-                    if dim_tools {
-                        eprintln!("\x1b[2mRunning {name}…\x1b[22m");
-                    } else {
-                        eprintln!("Running {name}…");
-                    }
+                    terminal::status(format_args!("Running {name}…"));
                     showing_tools = true;
                 }
             }

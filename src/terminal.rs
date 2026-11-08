@@ -3,10 +3,22 @@ use rustyline::{Behavior, Config, Editor, error::ReadlineError, history::Default
 use std::{
     borrow::Cow,
     fs::{File, OpenOptions},
-    io::{Read, Write},
+    io::{IsTerminal, Read, Write},
     os::unix::fs::OpenOptionsExt,
     time::Duration,
 };
+
+/// Print secondary information using the terminal's dim style when available.
+pub fn status(message: std::fmt::Arguments<'_>) {
+    let dim = std::io::stderr().is_terminal()
+        && std::env::var_os("NO_COLOR").is_none_or(|value| value.is_empty())
+        && std::env::var_os("TERM").is_none_or(|value| value != "dumb");
+    if dim {
+        eprintln!("\x1b[2m{message}\x1b[22m");
+    } else {
+        eprintln!("{message}");
+    }
+}
 
 pub enum Input {
     Line(String),
