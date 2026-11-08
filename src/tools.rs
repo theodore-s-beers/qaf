@@ -1,5 +1,9 @@
+use crate::{
+    permissions::{Access, Request},
+    sandbox::Sandbox,
+};
 use anyhow::{Context, Result, bail, ensure};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{
     fs::File,
@@ -19,16 +23,17 @@ const FILE_LIMIT: u64 = 1024 * 1024;
 pub struct Tools {
     directory: PathBuf,
     timeout: Duration,
+    sandbox: Option<Sandbox>,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Serialize)]
 #[serde(
     tag = "name",
     content = "arguments",
     rename_all = "snake_case",
     deny_unknown_fields
 )]
-enum Tool {
+pub enum Tool {
     ReadFile {
         path: String,
     },
@@ -47,12 +52,23 @@ enum Tool {
 }
 
 impl Tools {
-    pub fn new(directory: &Path, timeout: Duration) -> Result<Self> {
-        let directory = directory
-            .canonicalize()
-            .context("resolve working directory")?;
-        ensure!(directory.is_dir(), "working directory is not a directory");
-        Ok(Self { directory, timeout })
+    pub async fn new(directory: &Path, timeout: Duration, credentials: &Path) -> Result<Self> {
+        let sandbox = Sandbox::new(directory, credentials, &std::env::current_exe()?)?;
+        sandbox.check().await?;
+        Ok(Self {
+            directory: sandbox.project().to_owned(),
+            timeout,
+            sandbox: Some(sandbox),
+        })
+    }
+
+    #[cfg(test)]
+    pub fn for_test(directory: &Path, timeout: Duration) -> Result<Self> {
+        Ok(Self {
+            directory: directory.canonicalize()?,
+            timeout,
+            sandbox: None,
+        })
     }
 
     pub fn directory(&self) -> &Path {
@@ -66,102 +82,170 @@ impl Tools {
             ("edit_file", "Replace exactly one occurrence of old with new. Fails for missing or ambiguous matches.", vec!["path", "old", "new"]),
             ("shell", "Run a command with /bin/sh in the working directory. Returns exit code, stdout, stderr, and timeout status. Output is capped.", vec!["command"]),
         ].into_iter().map(|(name, description, fields)| {
-            let properties: serde_json::Map<String, Value> = fields.iter().map(|field| (field.to_string(), json!({"type": "string"}))).collect();
+            let mut properties: serde_json::Map<String, Value> = fields.iter().map(|field| (field.to_string(), json!({"type": "string"}))).collect();
+            properties.insert("access".into(), json!({"type": "string", "enum": ["sandbox", "unrestricted"],
+                "description": "Use sandbox normally. Unrestricted requests require human approval before execution; never retry automatically."}));
+            properties.insert("justification".into(), json!({"type": ["string", "null"],
+                "description": "Explain why broader access is needed for an unrestricted request; otherwise null."}));
+            let required: Vec<_> = fields.into_iter().chain(["access", "justification"]).collect();
             json!({"type": "function", "name": name, "description": description, "strict": true,
-                "parameters": {"type": "object", "properties": properties, "required": fields, "additionalProperties": false}})
+                "parameters": {"type": "object", "properties": properties, "required": required, "additionalProperties": false}})
         }).collect()
     }
 
+    #[cfg(test)]
     pub async fn execute(&self, name: &str, arguments: &str) -> Value {
-        match self.execute_inner(name, arguments).await {
+        match Request::parse(name, arguments) {
+            Ok(request) => self.run(&request).await,
+            Err(error) => json!({"error": format!("{error:#}")}),
+        }
+    }
+
+    // The caller must obtain human approval before passing Unrestricted.
+    pub async fn run(&self, request: &Request) -> Value {
+        match self.execute_inner(request).await {
             Ok(result) => result,
             Err(error) => json!({"error": format!("{error:#}")}),
         }
     }
 
-    async fn execute_inner(&self, name: &str, arguments: &str) -> Result<Value> {
-        let arguments: Value = serde_json::from_str(arguments).context("invalid tool arguments")?;
-        let tool: Tool = serde_json::from_value(json!({"name": name, "arguments": arguments}))
-            .context("unknown tool or invalid arguments")?;
-        match tool {
-            Tool::ReadFile { path } => {
-                let content = read_text(&self.directory.join(path))?;
-                Ok(json!({"content": clip(&content), "truncated": content.len() > OUTPUT_LIMIT}))
+    async fn execute_inner(&self, request: &Request) -> Result<Value> {
+        let unrestricted = request.access == Access::Unrestricted;
+        if let Some(sandbox) = &self.sandbox {
+            match &request.tool {
+                Tool::Shell { command } => {
+                    run_command(
+                        sandbox.shell_command(command, unrestricted)?,
+                        self.timeout,
+                        OUTPUT_LIMIT,
+                    )
+                    .await
+                }
+                tool => {
+                    let payload = serde_json::to_vec(tool)?;
+                    let (command, _request_file) = sandbox.file_command(&payload, unrestricted)?;
+                    let result = run_command(command, self.timeout, 256 * 1024).await?;
+                    ensure!(result["timed_out"] == false, "file tool timed out");
+                    ensure!(
+                        result["exit_code"] == 0,
+                        "file worker failed: {}",
+                        result["stderr"]
+                    );
+                    ensure!(
+                        result["stdout_truncated"] == false,
+                        "file worker response exceeded output limit"
+                    );
+                    serde_json::from_str(
+                        result["stdout"].as_str().context("missing worker output")?,
+                    )
+                    .context("invalid file worker response")
+                }
             }
-            Tool::WriteFile { path, content } => {
-                std::fs::write(self.directory.join(path), content).context("write file")?;
-                Ok(json!({"ok": true}))
+        } else {
+            // Only unit tests construct Tools without a sandbox.
+            #[cfg(test)]
+            {
+                match &request.tool {
+                    Tool::Shell { command } => self.shell(command).await,
+                    tool => execute_file(tool, &self.directory),
+                }
             }
-            Tool::EditFile { path, old, new } => {
-                ensure!(!old.is_empty(), "old must not be empty");
-                let path = self.directory.join(path);
-                let content = read_text(&path)?;
-                ensure!(
-                    content.matches(&old).count() == 1,
-                    "old must match exactly once; file unchanged"
-                );
-                std::fs::write(path, content.replacen(&old, &new, 1)).context("edit file")?;
-                Ok(json!({"ok": true}))
-            }
-            Tool::Shell { command } => self.shell(&command).await,
+            #[cfg(not(test))]
+            anyhow::bail!("sandbox is not configured")
         }
     }
 
+    #[cfg(test)]
     async fn shell(&self, script: &str) -> Result<Value> {
         let mut command = Command::new("/bin/sh");
         command
             .arg("-c")
             .arg(script)
             .current_dir(&self.directory)
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .kill_on_drop(true);
-        // A separate process group lets cancellation kill ordinary descendants as well.
-        #[cfg(unix)]
-        command.process_group(0);
-        let mut child = command.spawn().context("start shell")?;
-        #[cfg(unix)]
-        let group = ProcessGroup(
-            rustix::process::Pid::from_raw(i32::try_from(
-                child.id().context("missing child PID")?,
-            )?)
-            .context("invalid child PID")?,
-        );
-        let mut stdout = child.stdout.take().context("missing stdout")?;
-        let mut stderr = child.stderr.take().context("missing stderr")?;
-        let mut out = Vec::new();
-        let mut err = Vec::new();
-        let execution = async {
-            let (status, out_truncated, err_truncated) = tokio::try_join!(
-                child.wait(),
-                drain(&mut stdout, &mut out),
-                drain(&mut stderr, &mut err)
-            )?;
-            Ok::<_, std::io::Error>((status, out_truncated, err_truncated))
-        };
-        let (code, timed_out, out_truncated, err_truncated) =
-            if let Ok(result) = tokio::time::timeout(self.timeout, execution).await {
-                let (status, out_truncated, err_truncated) = result.context("run shell")?;
-                (status.code(), false, out_truncated, err_truncated)
-            } else {
-                #[cfg(unix)]
-                group.kill();
-                let _ = child.kill().await;
-                let _ = child.wait().await;
-                (
-                    None,
-                    true,
-                    out.len() >= OUTPUT_LIMIT,
-                    err.len() >= OUTPUT_LIMIT,
-                )
-            };
-        Ok(json!({
-            "exit_code": code, "timed_out": timed_out,
-            "stdout": String::from_utf8_lossy(&out), "stderr": String::from_utf8_lossy(&err),
-            "stdout_truncated": out_truncated, "stderr_truncated": err_truncated,
-        }))
+            .stdin(Stdio::null());
+        run_command(command, self.timeout, OUTPUT_LIMIT).await
     }
+}
+
+async fn run_command(mut command: Command, timeout: Duration, limit: usize) -> Result<Value> {
+    command
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+    #[cfg(unix)]
+    command.process_group(0);
+    let mut child = command.spawn().context("start shell")?;
+    #[cfg(unix)]
+    let group = ProcessGroup(
+        rustix::process::Pid::from_raw(i32::try_from(child.id().context("missing child PID")?)?)
+            .context("invalid child PID")?,
+    );
+    let mut stdout = child.stdout.take().context("missing stdout")?;
+    let mut stderr = child.stderr.take().context("missing stderr")?;
+    let mut out = Vec::new();
+    let mut err = Vec::new();
+    let execution = async {
+        let (status, out_truncated, err_truncated) = tokio::try_join!(
+            child.wait(),
+            drain(&mut stdout, &mut out, limit),
+            drain(&mut stderr, &mut err, limit)
+        )?;
+        Ok::<_, std::io::Error>((status, out_truncated, err_truncated))
+    };
+    let (code, timed_out, out_truncated, err_truncated) =
+        if let Ok(result) = tokio::time::timeout(timeout, execution).await {
+            let (status, out_truncated, err_truncated) = result.context("run shell")?;
+            (status.code(), false, out_truncated, err_truncated)
+        } else {
+            #[cfg(unix)]
+            group.kill();
+            let _ = child.kill().await;
+            let _ = child.wait().await;
+            (None, true, out.len() >= limit, err.len() >= limit)
+        };
+    Ok(json!({
+        "exit_code": code, "timed_out": timed_out,
+        "stdout": String::from_utf8_lossy(&out), "stderr": String::from_utf8_lossy(&err),
+        "stdout_truncated": out_truncated, "stderr_truncated": err_truncated,
+    }))
+}
+
+fn execute_file(tool: &Tool, directory: &Path) -> Result<Value> {
+    match tool {
+        Tool::ReadFile { path } => {
+            let content = read_text(&directory.join(path))?;
+            Ok(json!({"content": clip(&content), "truncated": content.len() > OUTPUT_LIMIT}))
+        }
+        Tool::WriteFile { path, content } => {
+            std::fs::write(directory.join(path), content).context("write file")?;
+            Ok(json!({"ok": true}))
+        }
+        Tool::EditFile { path, old, new } => {
+            ensure!(!old.is_empty(), "old must not be empty");
+            let path = directory.join(path);
+            let content = read_text(&path)?;
+            ensure!(
+                content.matches(old).count() == 1,
+                "old must match exactly once; file unchanged"
+            );
+            std::fs::write(path, content.replacen(old, new, 1)).context("edit file")?;
+            Ok(json!({"ok": true}))
+        }
+        Tool::Shell { .. } => anyhow::bail!("file worker cannot execute shell requests"),
+    }
+}
+
+/// Internal worker entrypoint. It inherits OS restrictions from its launcher.
+pub fn worker(path: &Path) -> Result<()> {
+    let payload = read_text(path)?;
+    let tool: Tool = serde_json::from_str(&payload).context("invalid worker request")?;
+    let result = execute_file(&tool, &std::env::current_dir()?);
+    let value = match result {
+        Ok(value) => value,
+        Err(error) => json!({"error": format!("{error:#}")}),
+    };
+    println!("{value}");
+    Ok(())
 }
 
 fn read_text(path: &Path) -> Result<String> {
@@ -187,6 +271,7 @@ fn clip(text: &str) -> &str {
 async fn drain(
     reader: &mut (impl AsyncRead + Unpin),
     output: &mut Vec<u8>,
+    limit: usize,
 ) -> std::io::Result<bool> {
     let mut buffer = Box::new([0u8; 8192]);
     let mut truncated = false;
@@ -195,7 +280,7 @@ async fn drain(
         if count == 0 {
             return Ok(truncated);
         }
-        let keep = count.min(OUTPUT_LIMIT.saturating_sub(output.len()));
+        let keep = count.min(limit.saturating_sub(output.len()));
         output.extend_from_slice(&buffer[..keep]);
         truncated |= keep < count;
     }
@@ -226,7 +311,7 @@ mod tests {
     async fn edit_rejects_ambiguous_matches_and_bad_arguments() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("file"), "same same").unwrap();
-        let tools = Tools::new(dir.path(), Duration::from_secs(1)).unwrap();
+        let tools = Tools::for_test(dir.path(), Duration::from_secs(1)).unwrap();
         let result = tools
             .execute(
                 "edit_file",
@@ -251,7 +336,7 @@ mod tests {
     #[tokio::test]
     async fn shell_bounds_output_and_reports_failure() {
         let dir = tempfile::tempdir().unwrap();
-        let tools = Tools::new(dir.path(), Duration::from_secs(5)).unwrap();
+        let tools = Tools::for_test(dir.path(), Duration::from_secs(5)).unwrap();
         let result = tools
             .execute(
                 "shell",
@@ -315,7 +400,7 @@ mod tests {
     #[tokio::test]
     async fn timeout_kills_a_running_descendant() {
         let dir = tempfile::tempdir().unwrap();
-        let tools = Tools::new(dir.path(), Duration::from_secs(60)).unwrap();
+        let tools = Tools::for_test(dir.path(), Duration::from_secs(60)).unwrap();
         let task = tokio::spawn(async move { tools.execute("shell", WAITING_CHILD).await });
         let pid = ready_child(dir.path()).await;
         // Advance only after OS-level readiness; process startup uses real time.
@@ -334,7 +419,7 @@ mod tests {
     #[tokio::test]
     async fn cancellation_kills_a_running_descendant() {
         let dir = tempfile::tempdir().unwrap();
-        let tools = Tools::new(dir.path(), Duration::from_secs(60)).unwrap();
+        let tools = Tools::for_test(dir.path(), Duration::from_secs(60)).unwrap();
         let task = tokio::spawn(async move { tools.execute("shell", WAITING_CHILD).await });
         let pid = ready_child(dir.path()).await;
         task.abort();

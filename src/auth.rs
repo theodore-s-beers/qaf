@@ -32,6 +32,16 @@ pub struct Store {
     directory: PathBuf,
 }
 
+struct StoreLock(File);
+
+impl Drop for StoreLock {
+    fn drop(&mut self) {
+        // A concurrently forked child can retain the descriptor until exec.
+        // Explicit unlock releases the lock without waiting for that close.
+        let _ = self.0.unlock();
+    }
+}
+
 #[derive(Serialize, Deserialize)]
 struct State {
     host_id: String,
@@ -91,7 +101,7 @@ impl Store {
     }
 
     // A process-wide file lock serializes rotating refresh tokens and atomic updates.
-    fn lock(&self) -> Result<File> {
+    fn lock(&self) -> Result<StoreLock> {
         #[cfg(unix)]
         {
             use std::os::unix::fs::DirBuilderExt;
@@ -114,7 +124,7 @@ impl Store {
             .context("open authentication lock")?;
         file.try_lock()
             .context("another qaf process is updating authentication; try again shortly")?;
-        Ok(file)
+        Ok(StoreLock(file))
     }
 
     fn read(&self) -> Result<State> {
@@ -138,6 +148,10 @@ impl Store {
             .context("save authentication state")?;
         File::open(&self.directory)?.sync_all()?;
         Ok(())
+    }
+
+    pub fn directory(&self) -> &std::path::Path {
+        &self.directory
     }
 
     pub fn status(&self) -> Result<()> {
@@ -845,8 +859,11 @@ mod tests {
                 0o600
             );
         }
+        // Model the duplicate descriptor briefly retained across fork/exec.
+        let inherited = lock.0.try_clone().unwrap();
         drop(lock);
         assert!(store.lock().is_ok());
+        drop(inherited);
     }
 
     #[tokio::test]

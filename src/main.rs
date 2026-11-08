@@ -1,6 +1,8 @@
 mod agent;
 mod auth;
 mod model;
+mod permissions;
+mod sandbox;
 mod tools;
 mod transcript;
 
@@ -15,7 +17,7 @@ use std::{
 #[derive(Parser)]
 #[command(
     version,
-    about = "A small coding agent. Tools run with your user's permissions."
+    about = "A small coding agent with sandboxed tools and human approval."
 )]
 struct Args {
     #[command(subcommand)]
@@ -55,10 +57,21 @@ enum Command {
     Status,
     /// List models available through your `ChatGPT` account
     Models,
+    /// Verify the OS sandbox can launch; no model request is made
+    SandboxCheck,
+}
+
+fn main() -> Result<()> {
+    let mut arguments = std::env::args_os().skip(1);
+    if arguments.next().as_deref() == Some(std::ffi::OsStr::new("__tool-worker")) {
+        let path = arguments.next().context("missing worker request")?;
+        return tools::worker(std::path::Path::new(&path));
+    }
+    run()
 }
 
 #[tokio::main]
-async fn main() -> Result<()> {
+async fn run() -> Result<()> {
     let args = Args::parse();
     let store = auth::Store::new(args.auth_dir)?;
     if let Some(command) = args.command {
@@ -73,6 +86,12 @@ async fn main() -> Result<()> {
                     }
                     Command::Logout => store.logout(&http, &args.account).await,
                     Command::Status => store.status(),
+                    Command::SandboxCheck => {
+                        let sandbox = sandbox::Sandbox::new(&args.directory, store.directory(), &std::env::current_exe()?)?;
+                        sandbox.check().await?;
+                        println!("Sandbox ready: project writes, private scratch, no network.");
+                        Ok(())
+                    }
                     Command::Models => {
                         for (slug, name) in model::Client::models(&store, &args.account).await? {
                             println!("{slug}\t{name}");
@@ -96,8 +115,13 @@ async fn main() -> Result<()> {
     if prompt.trim().is_empty() {
         bail!("prompt must not be empty");
     }
+    let tools = tools::Tools::new(
+        &args.directory,
+        Duration::from_secs(args.command_timeout),
+        store.directory(),
+    )
+    .await?;
     let model = model::Client::new(store, args.account.clone(), model_name.clone())?;
-    let tools = tools::Tools::new(&args.directory, Duration::from_secs(args.command_timeout))?;
     let path = args.transcript.unwrap_or_else(|| {
         let stamp = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -113,7 +137,7 @@ async fn main() -> Result<()> {
     eprintln!("Transcript: {}", path.display());
     let mut agent = agent::Agent::new(&prompt);
     let result = tokio::select! {
-        result = agent.run(&model, &tools, &mut transcript, args.max_turns, |event| {
+        result = agent.run(&model, &tools, &mut transcript, args.max_turns, &Human, |event| {
             match event {
                 agent::Event::Text(text) => println!("{text}"),
                 agent::Event::Tool(name) => eprintln!("Running {name}…"),
@@ -129,4 +153,58 @@ async fn main() -> Result<()> {
         Err(error) => transcript.record("error", &json!({"message": format!("{error:#}")}))?,
     }
     result
+}
+
+struct Human;
+
+impl permissions::Approver for Human {
+    async fn approve(&self, request: &serde_json::Value) -> Result<permissions::Decision> {
+        use std::{
+            fs::OpenOptions,
+            io::{Read, Write},
+            os::unix::fs::OpenOptionsExt,
+        };
+        let Ok(mut terminal) = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .custom_flags(libc::O_NONBLOCK | libc::O_NOCTTY)
+            .open("/dev/tty")
+        else {
+            eprintln!("Broader access denied: no interactive terminal is available.");
+            return Ok(permissions::Decision::Deny);
+        };
+        // JSON escaping prevents model-controlled terminal control sequences.
+        let prompt = format!(
+            "\nRun this operation WITHOUT the sandbox, with your user permissions?\n{}\nType allow (once), deny [default], or cancel: ",
+            serde_json::to_string_pretty(request)?
+        );
+        terminal.write_all(prompt.as_bytes())?;
+        let mut answer = Vec::new();
+        loop {
+            let mut byte = [0];
+            match terminal.read(&mut byte) {
+                Ok(0) => return Ok(permissions::Decision::Deny),
+                Ok(_) if byte[0] == b'\n' => break,
+                Ok(_) => {
+                    // Consume the entire line so leftovers cannot answer a later prompt.
+                    if answer.len() <= 32 {
+                        answer.push(byte[0]);
+                    }
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    tokio::time::sleep(Duration::from_millis(30)).await;
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(error) => return Err(error.into()),
+            }
+        }
+        if answer.len() > 32 {
+            return Ok(permissions::Decision::Deny);
+        }
+        Ok(match std::str::from_utf8(&answer).unwrap_or("").trim() {
+            "allow" => permissions::Decision::AllowOnce,
+            "cancel" => permissions::Decision::Cancel,
+            _ => permissions::Decision::Deny,
+        })
+    }
 }

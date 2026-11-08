@@ -343,7 +343,7 @@ mod tests {
         }
 
         let dir = tempfile::tempdir().unwrap();
-        let tools = Tools::new(dir.path(), Duration::from_secs(1)).unwrap();
+        let tools = Tools::for_test(dir.path(), Duration::from_secs(1)).unwrap();
         let mut transcript = Transcript::create(&dir.path().join("log")).unwrap();
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let model = StreamModel {
@@ -371,11 +371,18 @@ mod tests {
         let mut tool_events = 0;
         let (result, ()) = tokio::time::timeout(Duration::from_secs(5), async {
             tokio::join!(
-                agent.run(&model, &tools, &mut transcript, 1, |event| {
-                    if matches!(event, crate::agent::Event::Tool(_)) {
-                        tool_events += 1;
+                agent.run(
+                    &model,
+                    &tools,
+                    &mut transcript,
+                    1,
+                    &crate::permissions::Deny,
+                    |event| {
+                        if matches!(event, crate::agent::Event::Tool(_)) {
+                            tool_events += 1;
+                        }
                     }
-                }),
+                ),
                 server
             )
         })
