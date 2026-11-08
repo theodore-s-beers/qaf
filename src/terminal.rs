@@ -1,6 +1,7 @@
 use anyhow::{Context, Result, ensure};
-use rustyline::{Behavior, Config, DefaultEditor, error::ReadlineError};
+use rustyline::{Behavior, Config, Editor, error::ReadlineError, history::DefaultHistory};
 use std::{
+    borrow::Cow,
     fs::{File, OpenOptions},
     io::{Read, Write},
     os::unix::fs::OpenOptionsExt,
@@ -18,7 +19,31 @@ pub trait PromptReader {
 }
 
 pub struct LineEditor {
-    editor: Option<DefaultEditor>,
+    editor: Option<Editor<PromptStyle, DefaultHistory>>,
+}
+
+struct PromptStyle;
+
+impl rustyline::Helper for PromptStyle {}
+impl rustyline::completion::Completer for PromptStyle {
+    type Candidate = String;
+}
+impl rustyline::hint::Hinter for PromptStyle {
+    type Hint = String;
+}
+impl rustyline::validate::Validator for PromptStyle {}
+impl rustyline::highlight::Highlighter for PromptStyle {
+    fn highlight_prompt<'b, 's: 'b, 'p: 'b>(
+        &'s self,
+        prompt: &'p str,
+        default: bool,
+    ) -> Cow<'b, str> {
+        if default && prompt == "qaf> " {
+            Cow::Borrowed("\x1b[36mqaf>\x1b[39m ")
+        } else {
+            Cow::Borrowed(prompt)
+        }
+    }
 }
 
 impl LineEditor {
@@ -27,8 +52,12 @@ impl LineEditor {
             .behavior(Behavior::PreferTerm)
             .auto_add_history(true)
             .build();
+        // Rustyline handles color capability and NO_COLOR, and measures the
+        // unstyled prompt so highlighting doesn't affect cursor positioning.
+        let mut editor = Editor::with_config(config)?;
+        editor.set_helper(Some(PromptStyle));
         Ok(Self {
-            editor: Some(DefaultEditor::with_config(config)?),
+            editor: Some(editor),
         })
     }
 }

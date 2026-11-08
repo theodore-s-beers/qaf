@@ -185,6 +185,7 @@ async fn interactive(
     );
     let mut agent: Option<agent::Agent> = None;
     loop {
+        eprintln!();
         let line = match terminal.read_prompt().await? {
             terminal::Input::Line(line) => line,
             terminal::Input::Interrupted => continue,
@@ -197,7 +198,7 @@ async fn interactive(
             "/clear" => {
                 agent = None;
                 transcript.record("clear", &json!({}))?;
-                eprintln!("Conversation cleared. Files and scratch space are unchanged.");
+                eprintln!("\nConversation cleared. Files and scratch space are unchanged.");
                 continue;
             }
             _ if prompt.starts_with('/') && !prompt.contains(char::is_whitespace) => {
@@ -226,11 +227,28 @@ async fn task(
     transcript: &mut transcript::Transcript,
     max_turns: u32,
 ) -> Result<Result<(), String>> {
+    let mut showing_tools = false;
+    let dim_tools = std::io::stderr().is_terminal()
+        && std::env::var_os("NO_COLOR").is_none_or(|value| value.is_empty())
+        && std::env::var_os("TERM").is_none_or(|value| value != "dumb");
     let result = tokio::select! {
         result = agent.run(model, tools, transcript, max_turns, &terminal::Human, |event| {
             match event {
-                agent::Event::Text(text) => println!("{text}"),
-                agent::Event::Tool(name) => eprintln!("Running {name}…"),
+                agent::Event::Text(text) => {
+                    println!("\n{text}");
+                    showing_tools = false;
+                }
+                agent::Event::Tool(name) => {
+                    if !showing_tools {
+                        eprintln!();
+                    }
+                    if dim_tools {
+                        eprintln!("\x1b[2mRunning {name}…\x1b[22m");
+                    } else {
+                        eprintln!("Running {name}…");
+                    }
+                    showing_tools = true;
+                }
             }
         }) => result,
         signal = tokio::signal::ctrl_c() => {
