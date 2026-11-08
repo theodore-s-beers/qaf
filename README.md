@@ -37,7 +37,7 @@ Run `cargo run -- --help` for options.
 
 ## Structure
 
-`SYSTEM_PROMPT.md` is the source of the agent's developer prompt, embedded at compile time. Rebuild qaf after editing it.
+`SYSTEM_PROMPT.md` is the source of the agent's developer prompt, embedded at compile time. Rebuild qaf after editing it. At startup, qaf fills in `{{REQUESTED_MODEL}}` with the selected model identifier; this context is preserved after `/clear`.
 
 - `src/main.rs`: CLI configuration and session loop.
 - `src/terminal.rs`: terminal input, output, and human approvals.

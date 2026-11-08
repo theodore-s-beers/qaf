@@ -17,10 +17,12 @@ pub struct Agent {
 }
 
 impl Agent {
-    pub fn new(prompt: &str) -> Self {
+    pub fn new(prompt: &str, requested_model: &str) -> Self {
+        let instructions =
+            include_str!("../SYSTEM_PROMPT.md").replace("{{REQUESTED_MODEL}}", requested_model);
         Self {
             history: vec![
-                json!({"role": "developer", "content": include_str!("../SYSTEM_PROMPT.md")}),
+                json!({"role": "developer", "content": instructions}),
                 json!({"role": "user", "content": prompt}),
             ],
         }
@@ -198,7 +200,7 @@ mod tests {
         let tools = Tools::for_test(dir.path(), Duration::from_secs(30)).unwrap();
         let path = dir.path().join("transcript.jsonl");
         let mut transcript = Transcript::create(&path).unwrap();
-        let mut agent = Agent::new("Fix the test");
+        let mut agent = Agent::new("Fix the test", "test-model");
         agent
             .run(
                 &model,
@@ -270,7 +272,7 @@ mod tests {
             "read_file",
             &json!({"path": "missing"}),
         )]]);
-        let error = Agent::new("loop")
+        let error = Agent::new("loop", "test-model")
             .run(
                 &model,
                 &tools,
@@ -290,7 +292,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let tools = Tools::for_test(dir.path(), Duration::from_secs(1)).unwrap();
         let mut transcript = Transcript::create(&dir.path().join("log")).unwrap();
-        let error = Agent::new("task")
+        let error = Agent::new("task", "test-model")
             .run(
                 &Scripted::new(vec![]),
                 &tools,
@@ -302,7 +304,7 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(error.to_string(), "script exhausted");
-        let error = Agent::new("task")
+        let error = Agent::new("task", "test-model")
             .run(
                 &Scripted::new(vec![vec![]]),
                 &tools,
@@ -359,7 +361,7 @@ mod tests {
         let human = Human {
             calls: AtomicUsize::new(0),
         };
-        let mut agent = Agent::new("test approvals");
+        let mut agent = Agent::new("test approvals", "test-model");
         agent
             .run(&model, &tools, &mut transcript, 3, &human, |_| {})
             .await
@@ -417,7 +419,7 @@ mod tests {
                 "path":"never","content":"bad","access":"unrestricted","justification":"test"
             }),
         )]]);
-        let error = Agent::new("test")
+        let error = Agent::new("test", "test-model")
             .run(&model, &tools, &mut transcript, 2, &Cancel, |_| {})
             .await
             .unwrap_err();
@@ -431,7 +433,7 @@ mod tests {
         let tools = Tools::for_test(root.path(), Duration::from_secs(1)).unwrap();
         let mut transcript = Transcript::create(&root.path().join("log")).unwrap();
         let model = Scripted::new(vec![vec![answer()], vec![answer()]]);
-        let mut agent = Agent::new("First task");
+        let mut agent = Agent::new("First task", "test-model");
         agent
             .run(
                 &model,
@@ -483,7 +485,7 @@ mod tests {
             })
         });
         let model = Scripted::new(vec![calls.to_vec(), vec![answer()]]);
-        let mut agent = Agent::new("First task");
+        let mut agent = Agent::new("First task", "test-model");
         let waiting = Waiting(tokio::sync::Notify::new());
         tokio::select! {
             result = agent.run(&model, &tools, &mut transcript, 2, &waiting, |_| {}) => panic!("unexpected completion: {result:?}"),

@@ -154,12 +154,20 @@ async fn run() -> Result<()> {
     eprintln!("Model: {model_name}");
     eprintln!("Transcript: {}", path.display());
     if let Some(prompt) = args.prompt {
-        let mut agent = agent::Agent::new(&prompt);
+        let mut agent = agent::Agent::new(&prompt, &model_name);
         task(&mut agent, &model, &tools, &mut transcript, args.max_turns)
             .await?
             .map_err(anyhow::Error::msg)?;
     } else if let Some(terminal) = terminal {
-        interactive(&terminal, &model, &tools, &mut transcript, args.max_turns).await?;
+        interactive(
+            &terminal,
+            &model,
+            &tools,
+            &mut transcript,
+            args.max_turns,
+            &model_name,
+        )
+        .await?;
     }
     transcript.record("finished", &json!({}))
 }
@@ -170,6 +178,7 @@ async fn interactive(
     tools: &tools::Tools,
     transcript: &mut transcript::Transcript,
     max_turns: u32,
+    model_name: &str,
 ) -> Result<()> {
     eprintln!(
         "Enter a task. /clear starts fresh; /exit or Ctrl-D exits. Ctrl-C stops the current task."
@@ -204,7 +213,7 @@ async fn interactive(
         if let Some(agent) = agent.as_mut() {
             agent.add_prompt(prompt);
         }
-        let agent = agent.get_or_insert_with(|| agent::Agent::new(prompt));
+        let agent = agent.get_or_insert_with(|| agent::Agent::new(prompt, model_name));
         if let Err(error) = task(agent, model, tools, transcript, max_turns).await? {
             eprintln!(
                 "Task stopped: {error}\nYou can continue with another prompt, or /clear to start fresh."
@@ -279,11 +288,24 @@ mod tests {
         let (terminal, mut user) = terminal::Terminal::pair();
         user.write_all(b"first\nfollowup\n/clear\nthird\n/exit\n")
             .unwrap();
-        interactive(&terminal, &model, &tools, &mut transcript, 1)
-            .await
-            .unwrap();
+        interactive(
+            &terminal,
+            &model,
+            &tools,
+            &mut transcript,
+            1,
+            "session-model",
+        )
+        .await
+        .unwrap();
         let inputs = model.0.lock().unwrap();
         assert_eq!(inputs.len(), 3);
+        for input in inputs.iter() {
+            let instructions = input[0]["content"].as_str().unwrap();
+            assert!(instructions.contains("qaf"));
+            assert!(instructions.contains("`session-model`"));
+            assert!(!instructions.contains("{{REQUESTED_MODEL}}"));
+        }
         assert_eq!(inputs[1][1]["content"], "first");
         assert_eq!(inputs[1][2]["role"], "assistant");
         assert_eq!(inputs[1][3]["content"], "followup");

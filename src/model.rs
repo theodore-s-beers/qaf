@@ -367,7 +367,7 @@ mod tests {
             let body = format!("data: {event}\n\ndata: {{\"type\":\"response.completed\"");
             socket.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes()).await.unwrap();
         };
-        let mut agent = Agent::new("test incomplete response");
+        let mut agent = Agent::new("test incomplete response", "test-model");
         let mut tool_events = 0;
         let (result, ()) = tokio::time::timeout(Duration::from_secs(5), async {
             tokio::join!(
