@@ -13,13 +13,21 @@ cargo run -- --model YOUR_MODEL -C /path/to/project \
   "Fix the failing test and explain the change"
 ```
 
+Omit the task to start an interactive session:
+
+```sh
+cargo run -- --model YOUR_MODEL -C /path/to/project
+```
+
+Each prompt continues the conversation. `/clear` clears conversation history without undoing file changes; `/exit` or Ctrl-D exits. Ctrl-C during a task stops it and returns to the prompt. The `--max-turns` limit applies separately to each task. Sessions stay in memory and cannot be resumed after exit; use `/clear` if the conversation exceeds the model's context limit.
+
 Login opens your browser to authorize qaf to use your ChatGPT plan. Use `status` to view saved accounts and `logout` to sign out. To use another account or workspace, pass `--account LABEL` when logging in and running tasks.
 
 Credentials are stored with owner-only permissions in `~/.config/qaf/auth.json` (or `$XDG_CONFIG_HOME/qaf/auth.json`). Keep this directory out of source control.
 
-The agent can read, write, and edit files and run shell commands. Tools run in an OS sandbox: reads are broadly allowed, writes are limited to the project and temporary scratch space, and network access is blocked. The qaf credentials directory is inaccessible; existing project `.git` and `.jj` directories are read-only. Ctrl-C interrupts the run.
+The agent can read, write, and edit files and run shell commands. Tools run in an OS sandbox: reads are broadly allowed, writes are limited to the project and temporary scratch space, and network access is blocked. The qaf credentials directory is inaccessible; existing project `.git` and `.jj` directories are read-only. Ctrl-C interrupts the current task.
 
-For broader access, the agent must request unrestricted execution with a justification. qaf shows the operation in your terminal: type `allow` to approve that one operation, `deny` (the default) to reject it, or `cancel` to stop the run. Approval permits execution with your user's permissions. Without an interactive terminal, requests are denied. Failed sandboxed operations are never automatically retried unrestricted.
+For broader access, the agent must request unrestricted execution with a justification. qaf shows the operation in your terminal: type `allow` to approve that one operation, `deny` (the default) to reject it, or `cancel` to stop the current task. Approval permits execution with your user's permissions. Without an interactive terminal, requests are denied. Failed sandboxed operations are never automatically retried unrestricted.
 
 macOS uses the built-in `/usr/bin/sandbox-exec`. Linux (x86-64 or ARM64) requires `bubblewrap` and enabled user namespaces; distribution security settings may restrict these. Check availability with `cargo run -- -C /path/to/project sandbox-check`. qaf refuses to run tools if the sandbox cannot start.
 
@@ -29,7 +37,8 @@ Run `cargo run -- --help` for options.
 
 ## Structure
 
-- `src/main.rs`: CLI configuration and terminal output.
+- `src/main.rs`: CLI configuration and session loop.
+- `src/terminal.rs`: terminal input, output, and human approvals.
 - `src/auth.rs`: ChatGPT login, credentials, and token refresh.
 - `src/agent.rs`: conversation history and the model/tool loop.
 - `src/model.rs`: OpenAI Responses API integration.

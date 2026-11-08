@@ -26,6 +26,32 @@ impl Agent {
         }
     }
 
+    pub fn add_prompt(&mut self, prompt: &str) {
+        self.history
+            .push(json!({"role": "user", "content": prompt}));
+    }
+
+    /// Close unanswered calls before another user turn, without replaying tools.
+    pub fn stop(&mut self, transcript: &mut Transcript) -> Result<()> {
+        let mut pending = Vec::new();
+        for item in &self.history {
+            match item["type"].as_str() {
+                Some("function_call") => pending.push(item["call_id"].clone()),
+                Some("function_call_output") => pending.retain(|id| *id != item["call_id"]),
+                _ => {}
+            }
+        }
+        for call_id in pending {
+            let item = json!({"type": "function_call_output", "call_id": call_id,
+                "output": json!({"error": "Task stopped before a result was received. This tool may not have run, or may have partially executed. Check state before retrying."}).to_string()});
+            self.history.push(item.clone());
+            transcript.record("tool_result", &item)?;
+        }
+        let note = json!({"role": "developer", "content": "The previous task stopped before completion. No further tools from that task will run. Changes already made were not rolled back. Wait for the user's next instruction."});
+        self.history.push(note.clone());
+        transcript.record("task_stopped", &note)
+    }
+
     pub async fn run(
         &mut self,
         model: &impl Model,
@@ -398,5 +424,103 @@ mod tests {
         assert!(error.to_string().contains("cancelled"));
         assert!(!dir.path().join("never").exists());
         assert_eq!(model.requests.lock().unwrap().len(), 1);
+    }
+    #[tokio::test]
+    async fn followups_preserve_context_and_get_a_fresh_turn_budget() {
+        let root = tempfile::tempdir().unwrap();
+        let tools = Tools::for_test(root.path(), Duration::from_secs(1)).unwrap();
+        let mut transcript = Transcript::create(&root.path().join("log")).unwrap();
+        let model = Scripted::new(vec![vec![answer()], vec![answer()]]);
+        let mut agent = Agent::new("First task");
+        agent
+            .run(
+                &model,
+                &tools,
+                &mut transcript,
+                1,
+                &crate::permissions::Deny,
+                |_| {},
+            )
+            .await
+            .unwrap();
+        agent.add_prompt("Follow up");
+        agent
+            .run(
+                &model,
+                &tools,
+                &mut transcript,
+                1,
+                &crate::permissions::Deny,
+                |_| {},
+            )
+            .await
+            .unwrap();
+        let inputs = model.requests.lock().unwrap().clone();
+        assert_eq!(inputs.len(), 2);
+        assert_eq!(inputs[1][1]["content"], "First task");
+        assert_eq!(inputs[1][2], answer());
+        assert_eq!(inputs[1][3]["content"], "Follow up");
+    }
+
+    #[tokio::test]
+    async fn dropped_task_closes_pending_calls_without_replaying_completed_tools() {
+        struct Waiting(tokio::sync::Notify);
+        impl Approver for Waiting {
+            async fn approve(&self, _: &Value) -> Result<Decision> {
+                self.0.notify_one();
+                std::future::pending().await
+            }
+        }
+        let root = tempfile::tempdir().unwrap();
+        let tools = Tools::for_test(root.path(), Duration::from_secs(1)).unwrap();
+        let mut transcript = Transcript::create(&root.path().join("log")).unwrap();
+        let calls = ["completed", "waiting", "unstarted"].map(|id| {
+            json!({
+                "type":"function_call", "name":"write_file", "call_id":id,
+                "arguments": json!({"path":id,"content":"original",
+                    "access": if id == "waiting" { "unrestricted" } else { "sandbox" },
+                    "justification":"test"}).to_string()
+            })
+        });
+        let model = Scripted::new(vec![calls.to_vec(), vec![answer()]]);
+        let mut agent = Agent::new("First task");
+        let waiting = Waiting(tokio::sync::Notify::new());
+        tokio::select! {
+            result = agent.run(&model, &tools, &mut transcript, 2, &waiting, |_| {}) => panic!("unexpected completion: {result:?}"),
+            () = waiting.0.notified() => {}
+        }
+        agent.stop(&mut transcript).unwrap();
+        assert!(root.path().join("completed").exists());
+        assert!(!root.path().join("waiting").exists());
+        assert!(!root.path().join("unstarted").exists());
+        std::fs::write(root.path().join("completed"), "changed by user").unwrap();
+        agent.add_prompt("Continue with a different task");
+        agent
+            .run(
+                &model,
+                &tools,
+                &mut transcript,
+                1,
+                &crate::permissions::Deny,
+                |_| {},
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(root.path().join("completed")).unwrap(),
+            "changed by user"
+        );
+        let inputs = model.requests.lock().unwrap().clone();
+        let outputs: Vec<_> = inputs[1]
+            .iter()
+            .filter(|item| item["type"] == "function_call_output")
+            .collect();
+        assert_eq!(outputs.len(), 3);
+        assert_eq!(outputs[0]["call_id"], "completed");
+        assert!(outputs[0]["output"].as_str().unwrap().contains("true"));
+        for (output, id) in outputs[1..].iter().zip(["waiting", "unstarted"]) {
+            assert_eq!(output["call_id"], id);
+            assert!(output["output"].as_str().unwrap().contains("Task stopped"));
+        }
     }
 }
