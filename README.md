@@ -37,6 +37,8 @@ Run `cargo run -- --help` for options.
 
 ## Structure
 
+`SYSTEM_PROMPT.md` is the source of the agent's developer prompt, embedded at compile time. Rebuild qaf after editing it.
+
 - `src/main.rs`: CLI configuration and session loop.
 - `src/terminal.rs`: terminal input, output, and human approvals.
 - `src/auth.rs`: ChatGPT login, credentials, and token refresh.
