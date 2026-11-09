@@ -9,6 +9,8 @@ use serde_json::{Value, json};
 
 pub enum Event<'a> {
     Text(&'a str),
+    Delta(&'a str),
+    Search,
     Approval,
     Compacted,
     Tool(&'a crate::tools::Tool),
@@ -73,6 +75,55 @@ impl Agent {
         transcript.record("task_stopped", &note)
     }
 
+    fn record_reply(
+        &mut self,
+        reply: crate::model::Reply,
+        transcript: &mut Transcript,
+        emit: &mut impl FnMut(Event<'_>),
+    ) -> Result<()> {
+        let boundary = reply
+            .output
+            .iter()
+            .rposition(|item| item["type"] == "compaction");
+        if let Some(index) = boundary {
+            ensure!(
+                reply.output[index]["encrypted_content"]
+                    .as_str()
+                    .is_some_and(|s| !s.is_empty()),
+                "compaction returned empty encrypted context; original history retained"
+            );
+            ensure!(
+                !reply.output[..index]
+                    .iter()
+                    .any(|item| item["type"] == "function_call"),
+                "compaction interrupted a tool batch; original history retained"
+            );
+            transcript.record(
+                "compaction",
+                &json!({"discarded_items":self.history.len() - 1 + index}),
+            )?;
+        }
+        if let Some(usage) = &reply.usage {
+            transcript.record("usage", &json!(usage))?;
+        }
+        for item in &reply.output {
+            self.review_history.push(item);
+        }
+        if let Some(index) = boundary {
+            // Keep trusted harness instructions explicit; the encrypted item carries
+            // earlier conversation state. Preserve all items after that boundary.
+            self.history.truncate(1);
+            self.history.extend(reply.output.into_iter().skip(index));
+            self.context.compacted();
+            emit(Event::Compacted);
+        } else {
+            self.history.extend(reply.output);
+            self.context
+                .record(reply.usage.as_ref(), self.history.len());
+        }
+        Ok(())
+    }
+
     pub async fn run(
         &mut self,
         model: &impl Model,
@@ -85,50 +136,26 @@ impl Agent {
         transcript.record("input", &json!(self.history))?;
         let definitions = Tools::definitions();
         for _ in 0..max_turns {
-            let reply = model.respond(&self.history, &definitions).await?;
+            let reply = model
+                .respond_stream(&self.history, &definitions, &mut |progress| {
+                    match progress {
+                        crate::model::Progress::Text(text) => {
+                            transcript.record("model_delta", &json!({"text":text}))?;
+                            emit(Event::Delta(text));
+                        }
+                        crate::model::Progress::Search => {
+                            transcript.record("web_search", &json!({"status":"searching"}))?;
+                            emit(Event::Search);
+                        }
+                    }
+                    Ok(())
+                })
+                .await?;
             transcript.record("model", &json!(reply.output))?;
             let calls = reply.calls()?;
-            let text = reply.text();
-            let boundary = reply
-                .output
-                .iter()
-                .rposition(|item| item["type"] == "compaction");
-            if let Some(index) = boundary {
-                ensure!(
-                    reply.output[index]["encrypted_content"]
-                        .as_str()
-                        .is_some_and(|s| !s.is_empty()),
-                    "compaction returned empty encrypted context; original history retained"
-                );
-                ensure!(
-                    !reply.output[..index]
-                        .iter()
-                        .any(|item| item["type"] == "function_call"),
-                    "compaction interrupted a tool batch; original history retained"
-                );
-                transcript.record(
-                    "compaction",
-                    &json!({"discarded_items":self.history.len() - 1 + index}),
-                )?;
-            }
-            if let Some(usage) = &reply.usage {
-                transcript.record("usage", &json!(usage))?;
-            }
-            for item in &reply.output {
-                self.review_history.push(item);
-            }
-            if let Some(index) = boundary {
-                // Keep trusted harness instructions explicit; the encrypted item carries
-                // earlier conversation state. Preserve all items after that boundary.
-                self.history.truncate(1);
-                self.history.extend(reply.output.into_iter().skip(index));
-                self.context.compacted();
-                emit(Event::Compacted);
-            } else {
-                self.history.extend(reply.output);
-                self.context
-                    .record(reply.usage.as_ref(), self.history.len());
-            }
+            let mut text = reply.text();
+            text.push_str(&reply.citations());
+            self.record_reply(reply, transcript, &mut emit)?;
             if !text.is_empty() {
                 emit(Event::Text(&text));
             }

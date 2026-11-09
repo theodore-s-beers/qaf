@@ -15,7 +15,7 @@ use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
 use serde_json::json;
 use std::{
-    io::IsTerminal,
+    io::{IsTerminal, Write},
     path::PathBuf,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -324,12 +324,29 @@ async fn task(
     approver: &impl permissions::Approver,
 ) -> Result<Result<(), String>> {
     let mut showing_tools = false;
+    let mut rendering = render::Stream::new();
+    let mut output_error = None;
     let result = tokio::select! {
         result = agent.run(model, tools, transcript, max_turns, approver, |event| {
             match event {
                 agent::Event::Text(text) => {
-                    println!("\n{}", render::response(text));
+                    match rendering.finish(text) {
+                        Ok(output) => print!("{output}"),
+                        Err(error) => output_error = Some(error),
+                    }
                     showing_tools = false;
+                }
+                agent::Event::Delta(text) => {
+                    print!("{}", rendering.push(text));
+                    if let Err(error) = std::io::stdout().flush() { output_error = Some(error.into()); }
+                    showing_tools = false;
+                }
+                agent::Event::Search => {
+                    if !showing_tools {
+                        eprintln!();
+                    }
+                    terminal::status(format_args!("Searching the web…"));
+                    showing_tools = true;
                 }
                 agent::Event::Approval => showing_tools = false,
                 agent::Event::Compacted => {
@@ -350,6 +367,8 @@ async fn task(
             Err(anyhow::anyhow!("interrupted"))
         }
     };
+    print!("{}", rendering.finish_partial());
+    let result = result.and_then(|()| output_error.map_or(Ok(()), Err));
     match &result {
         Ok(()) => transcript.record("task_finished", &json!({}))?,
         Err(error) => {

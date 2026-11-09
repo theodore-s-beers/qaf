@@ -3,15 +3,115 @@ use std::{borrow::Cow, io::IsTerminal};
 
 use pulldown_cmark::{Event, Options, Parser, Tag, TagEnd};
 
-pub fn response(source: &str) -> Cow<'_, str> {
-    if !std::io::stdout().is_terminal()
+fn styled() -> bool {
+    !(!std::io::stdout().is_terminal()
         || std::env::var_os("NO_COLOR").is_some_and(|value| !value.is_empty())
-        || std::env::var_os("TERM").is_some_and(|value| value == "dumb")
-    {
+        || std::env::var_os("TERM").is_some_and(|value| value == "dumb"))
+}
+
+pub fn response(source: &str) -> Cow<'_, str> {
+    if !styled() {
         return Cow::Borrowed(source);
     }
     let width = terminal_size::terminal_size().map_or(80, |(width, _)| usize::from(width.0));
     Cow::Owned(markdown(source, width))
+}
+
+// Render only stable top-level Markdown blocks. The unfinished final block stays
+// buffered so a fence, list, or emphasis span is never interpreted halfway through.
+pub struct Stream {
+    source: String,
+    emitted: usize,
+    started: bool,
+    styled: bool,
+}
+
+impl Stream {
+    pub fn new() -> Self {
+        Self {
+            source: String::new(),
+            emitted: 0,
+            started: false,
+            styled: styled(),
+        }
+    }
+
+    pub fn push(&mut self, delta: &str) -> String {
+        let boundary_changed = self.source.ends_with('\n') || delta.contains('\n');
+        self.source.push_str(delta);
+        let end = if !self.styled {
+            self.source.len()
+        } else if boundary_changed {
+            stable_end(&self.source)
+        } else {
+            self.emitted
+        };
+        self.take(end)
+    }
+
+    pub fn finish(&mut self, final_text: &str) -> anyhow::Result<String> {
+        anyhow::ensure!(
+            final_text.starts_with(&self.source[..self.emitted]),
+            "completed text differs from streamed text"
+        );
+        final_text.clone_into(&mut self.source);
+        Ok(self.finish_partial())
+    }
+
+    pub fn finish_partial(&mut self) -> String {
+        let mut output = self.take(self.source.len());
+        if self.started {
+            output.push('\n');
+        }
+        self.source.clear();
+        self.emitted = 0;
+        self.started = false;
+        output
+    }
+
+    fn take(&mut self, end: usize) -> String {
+        if end <= self.emitted {
+            return String::new();
+        }
+        let chunk = &self.source[self.emitted..end];
+        let text = if self.styled {
+            response(chunk).trim_end().to_owned()
+        } else {
+            chunk.to_owned()
+        };
+        self.emitted = end;
+        if text.is_empty() {
+            return text;
+        }
+        let prefix = if !self.started {
+            "\n"
+        } else if self.styled {
+            "\n\n"
+        } else {
+            ""
+        };
+        self.started = true;
+        format!("{prefix}{text}")
+    }
+}
+
+fn stable_end(source: &str) -> usize {
+    let mut depth = 0;
+    let mut last_start = 0;
+    for (event, range) in Parser::new_ext(source, Options::ENABLE_TABLES).into_offset_iter() {
+        match event {
+            Event::Start(_) => {
+                if depth == 0 {
+                    last_start = range.start;
+                }
+                depth += 1;
+            }
+            Event::End(_) => depth -= 1,
+            Event::Rule if depth == 0 => last_start = range.start,
+            _ => {}
+        }
+    }
+    last_start
 }
 
 #[derive(Default)]
@@ -237,7 +337,38 @@ fn markdown(source: &str, width: usize) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::markdown;
+    use super::{Stream, markdown};
+
+    #[test]
+    fn streaming_buffers_unfinished_blocks_and_flushes_partial_text() {
+        let mut stream = Stream::new();
+        stream.styled = true;
+        assert_eq!(stream.push("First **bold"), "");
+        assert_eq!(stream.push("** paragraph.\n\n"), "");
+        assert_ne!(stream.push("```rust\n"), "");
+        let emitted = stream.emitted;
+        assert_eq!(stream.push("let x = 1;\n\n"), "");
+        assert_eq!(stream.emitted, emitted);
+        assert_eq!(stream.push("```\n\n"), "");
+        assert_ne!(stream.push("Next paragraph"), "");
+        let remaining = stream.finish_partial();
+        assert!(remaining.contains("Next paragraph"));
+        assert_eq!(stream.finish_partial(), "");
+
+        stream.styled = false;
+        assert_eq!(stream.push("A café"), "\nA café");
+        assert_eq!(stream.push("."), ".");
+        assert_eq!(
+            stream
+                .finish("A café.\n\nSources:\n- <https://example.com>")
+                .unwrap(),
+            "\n\nSources:\n- <https://example.com>\n"
+        );
+        assert_eq!(
+            stream.finish("No delta fallback").unwrap(),
+            "\nNo delta fallback\n"
+        );
+    }
 
     #[test]
     fn nested_styles_restore_outer_style() {

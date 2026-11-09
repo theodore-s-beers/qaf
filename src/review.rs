@@ -70,7 +70,7 @@ fn visible(item: &Value) -> bool {
         && matches!(item["type"].as_str(), None | Some("message"))
         || matches!(
             item["type"].as_str(),
-            Some("function_call" | "function_call_output")
+            Some("function_call" | "function_call_output" | "web_search_call")
         )
 }
 

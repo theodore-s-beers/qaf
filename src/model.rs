@@ -1,12 +1,26 @@
 use anyhow::{Context, Result, bail, ensure};
 use serde::Deserialize;
 use serde_json::{Value, json};
-use std::{future::Future, sync::RwLock, time::Duration};
+use std::{collections::BTreeMap, future::Future, sync::RwLock, time::Duration};
+
+pub enum Progress<'a> {
+    Text(&'a str),
+    Search,
+}
 
 // The only abstraction: tests can supply scripted replies to the real agent loop.
 pub trait Model: Sync {
     fn select_model(&self, _name: &str) -> impl Future<Output = Result<()>> + Send {
         std::future::ready(Err(anyhow::anyhow!("model switching is unavailable")))
+    }
+
+    async fn respond_stream(
+        &self,
+        history: &[Value],
+        tools: &[Value],
+        _emit: &mut (impl FnMut(Progress<'_>) -> Result<()> + Send),
+    ) -> Result<Reply> {
+        self.respond(history, tools).await
     }
 
     fn respond(
@@ -89,7 +103,7 @@ impl Client {
 fn request_body(model: &str, history: &[Value], tools: &[Value]) -> Value {
     json!({
         "model": model, "input": history,
-        "tools": if tools.is_empty() { vec![] } else { vec![json!({"type": "namespace", "name": "qaf", "description": "Local coding tools", "tools": tools})] },
+        "tools": if tools.is_empty() { vec![] } else { vec![json!({"type": "namespace", "name": "qaf", "description": "Local coding tools", "tools": tools}), json!({"type":"web_search"})] },
         "store": false, "stream": true, "include": ["reasoning.encrypted_content"],
         "parallel_tool_calls": false,
         "context_management": [{"type":"compaction", "compact_threshold":crate::context::COMPACT_AT}],
@@ -107,6 +121,15 @@ impl Model for Client {
     }
 
     async fn respond(&self, history: &[Value], tools: &[Value]) -> Result<Reply> {
+        self.respond_stream(history, tools, &mut |_| Ok(())).await
+    }
+
+    async fn respond_stream(
+        &self,
+        history: &[Value],
+        tools: &[Value],
+        emit: &mut (impl FnMut(Progress<'_>) -> Result<()> + Send),
+    ) -> Result<Reply> {
         let token = self.store.access_token(&self.http, &self.account).await?;
         let selected = self
             .model
@@ -121,25 +144,104 @@ impl Model for Client {
             .send()
             .await
             .context("request model response")?;
-        read_reply(response).await
+        read_reply_stream(response, emit).await
     }
 }
 
-async fn read_reply(mut response: reqwest::Response) -> Result<Reply> {
+#[cfg(test)]
+async fn read_reply(response: reqwest::Response) -> Result<Reply> {
+    read_reply_stream(response, &mut |_| Ok(())).await
+}
+
+async fn read_reply_stream(
+    mut response: reqwest::Response,
+    emit: &mut (impl FnMut(Progress<'_>) -> Result<()> + Send),
+) -> Result<Reply> {
     let status = response.status();
     if !status.is_success() {
         let body: Value = response.json().await.unwrap_or(Value::Null);
         bail!("model API returned {status}: {}", api_error(&body));
     }
     let mut stream = Events::default();
+    let mut output = StreamOutput::default();
     while let Some(chunk) = response.chunk().await.context("read model stream")? {
         for event in stream.push(&chunk)? {
-            if let Some(reply) = completion(&event)? {
+            if let Some(reply) = output.accept(&event, emit)? {
                 return Ok(reply);
             }
         }
     }
-    bail!("model stream ended before response.completed; no tools were executed for this turn")
+    bail!(
+        "model stream ended before response.completed; no local tools were executed for this turn"
+    )
+}
+
+#[derive(Default)]
+struct StreamOutput {
+    items: BTreeMap<u64, Value>,
+    last_text: Option<(u64, u64)>,
+    bytes: usize,
+}
+
+impl StreamOutput {
+    fn accept(
+        &mut self,
+        event: &Value,
+        emit: &mut impl FnMut(Progress<'_>) -> Result<()>,
+    ) -> Result<Option<Reply>> {
+        match event["type"].as_str() {
+            Some("response.output_text.delta" | "response.refusal.delta") => {
+                let delta = event["delta"].as_str().context("text delta omitted text")?;
+                let key = (
+                    event["output_index"]
+                        .as_u64()
+                        .context("text delta omitted output index")?,
+                    event["content_index"]
+                        .as_u64()
+                        .context("text delta omitted content index")?,
+                );
+                if self.last_text.is_some_and(|last| last != key) {
+                    emit(Progress::Text("\n"))?;
+                }
+                self.last_text = Some(key);
+                emit(Progress::Text(delta))?;
+            }
+            Some("response.web_search_call.searching") => emit(Progress::Search)?,
+            Some("response.output_item.done") => {
+                let index = event["output_index"]
+                    .as_u64()
+                    .context("completed item omitted output index")?;
+                let item = &event["item"];
+                ensure!(item.is_object(), "completed item omitted payload");
+                self.bytes += item.to_string().len();
+                ensure!(
+                    self.bytes <= 32 * 1024 * 1024,
+                    "model output exceeds 32 MiB"
+                );
+                ensure!(
+                    !self.items.contains_key(&index),
+                    "duplicate completed output item"
+                );
+                self.items.insert(index, item.clone());
+            }
+            _ => {}
+        }
+        if let Some(mut reply) = completion(event)? {
+            // Some subscription responses carry items only in output_item.done.
+            // When populated, the terminal output remains authoritative.
+            if reply.output.is_empty() {
+                for (expected, index) in self.items.keys().enumerate() {
+                    ensure!(
+                        expected as u64 == *index,
+                        "model stream omitted an output item"
+                    );
+                }
+                reply.output = std::mem::take(&mut self.items).into_values().collect();
+            }
+            return Ok(Some(reply));
+        }
+        Ok(None)
+    }
 }
 
 fn api_error(body: &Value) -> String {
@@ -265,6 +367,40 @@ impl Reply {
             .collect()
     }
 
+    pub fn citations(&self) -> String {
+        let text = self.text();
+        let mut urls = Vec::new();
+        for part in self
+            .output
+            .iter()
+            .filter_map(|item| item["content"].as_array())
+            .flatten()
+        {
+            for annotation in part["annotations"].as_array().into_iter().flatten() {
+                if annotation["type"] == "url_citation"
+                    && let Some(url) = annotation["url"]
+                        .as_str()
+                        .filter(|url| url.starts_with("https://") || url.starts_with("http://"))
+                    && !text.contains(url)
+                    && !urls.contains(&url)
+                {
+                    urls.push(url);
+                }
+            }
+        }
+        if urls.is_empty() {
+            String::new()
+        } else {
+            format!(
+                "\n\nSources:\n{}",
+                urls.iter()
+                    .map(|url| format!("- <{url}>"))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            )
+        }
+    }
+
     pub fn text(&self) -> String {
         self.output
             .iter()
@@ -340,6 +476,8 @@ mod tests {
         assert_eq!(body["tools"][0]["type"], "namespace");
         assert_eq!(body["tools"][0]["name"], "qaf");
         assert_eq!(body["tools"][0]["tools"][0]["name"], "read_file");
+        assert_eq!(body["tools"][1]["type"], "web_search");
+        assert_eq!(request_body("reviewer", &[], &[])["tools"], json!([]));
         assert!(body.get("previous_response_id").is_none());
     }
 
@@ -370,6 +508,55 @@ mod tests {
             assert_eq!(replies[0].output[0], reasoning);
             assert_eq!(replies[0].calls().unwrap()[0].name, "read_file");
         }
+    }
+
+    #[test]
+    fn streaming_search_preserves_items_citations_and_does_not_duplicate_output() {
+        let search = json!({"type":"web_search_call", "status":"completed", "action":{"type":"search","query":"Rust"}});
+        let message = json!({"type":"message","role":"assistant","content":[{"type":"output_text","text":"A café.","annotations":[{"type":"url_citation","url":"https://example.com/source","title":"Source"}]}]});
+        for terminal_output in [vec![], vec![search.clone(), message.clone()]] {
+            let events = [
+                json!({"type":"response.web_search_call.searching"}),
+                json!({"type":"response.output_item.done","output_index":0,"item":search}),
+                json!({"type":"response.output_text.delta","output_index":1,"content_index":0,"delta":"A café."}),
+                json!({"type":"response.output_item.done","output_index":1,"item":message}),
+                json!({"type":"response.completed","response":{"status":"completed","output":terminal_output}}),
+            ];
+            let mut output = StreamOutput::default();
+            let mut text = String::new();
+            let mut searches = 0;
+            for event in &events[..4] {
+                assert!(
+                    output
+                        .accept(event, &mut |progress| {
+                            match progress {
+                                Progress::Text(delta) => text.push_str(delta),
+                                Progress::Search => searches += 1,
+                            }
+                            Ok(())
+                        })
+                        .unwrap()
+                        .is_none()
+                );
+            }
+            assert_eq!(text, "A café.");
+            assert_eq!(searches, 1);
+            let reply = output
+                .accept(&events[4], &mut |_| panic!("duplicate progress"))
+                .unwrap()
+                .unwrap();
+            assert_eq!(reply.output, vec![search.clone(), message.clone()]);
+            assert_eq!(reply.text(), text);
+            assert!(reply.citations().contains("https://example.com/source"));
+        }
+        let mut output = StreamOutput::default();
+        output
+            .accept(
+                &json!({"type":"response.output_item.done","output_index":1,"item":message}),
+                &mut |_| Ok(()),
+            )
+            .unwrap();
+        assert!(output.accept(&json!({"type":"response.completed","response":{"status":"completed","output":[]}}), &mut |_| Ok(())).is_err());
     }
 
     #[test]
@@ -442,7 +629,7 @@ mod tests {
                 assert!(count > 0);
                 request.extend_from_slice(&buffer[..count]);
             }
-            let event = json!({"type": "response.output_item.done", "item": {
+            let event = json!({"type": "response.output_item.done", "output_index":0, "item": {
                 "type":"function_call", "namespace":"qaf", "name":"write_file", "call_id":"c1",
                 "arguments": r#"{"path":"must-not-exist","content":"unexpected"}"#
             }});

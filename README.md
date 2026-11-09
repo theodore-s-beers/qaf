@@ -27,7 +27,7 @@ In a session, each prompt continues the conversation:
 - Ctrl-C stops the current task, or discards input at the prompt.
 - Up/Down recall previous inputs.
 
-Conversation and input history last only for the current session. `--max-turns` applies separately to each task. Responses render Markdown in the terminal; redirected output and `NO_COLOR` preserve the original Markdown.
+Conversation and input history last only for the current session. `--max-turns` applies separately to each task. Responses stream as completed Markdown blocks in the terminal; redirected output and `NO_COLOR` stream raw Markdown. Unfinished blocks are flushed when a task stops.
 
 qaf requests server-side compaction at 230,000 tokens, leaving headroom within a 258,000-token working budget. This is not a hard input limit. Compaction replaces older conversation with encrypted state; the full transcript remains intact. Usage is approximate between responses and immediately after compaction.
 
@@ -39,7 +39,7 @@ See `cargo run -- --help` for options.
 
 ## Permissions
 
-Tools read, write, and edit files and run shell commands. The OS sandbox permits broad reads but limits writes to the project and temporary scratch space. It blocks network access and access to qaf's configuration directory; existing project `.git` and `.jj` directories are read-only.
+Tools read, write, and edit files and run shell commands. The main agent also has OpenAI-hosted web search, with source links in its answers. Search runs remotely, outside the local sandbox; the approval reviewer has no search tool. The OS sandbox permits broad reads but limits writes to the project and temporary scratch space. It blocks network access and access to qaf's configuration directory; existing project `.git` and `.jj` directories are read-only.
 
 macOS uses `/usr/bin/sandbox-exec`. Linux (x86-64 or ARM64) requires `bubblewrap` and enabled user namespaces. Check support with:
 
