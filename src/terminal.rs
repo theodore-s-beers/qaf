@@ -199,6 +199,70 @@ impl Terminal {
     }
 }
 
+fn approval_prompt(request: &serde_json::Value) -> Result<String> {
+    use crate::tools::Tool;
+    use std::fmt::Write as _;
+
+    let tool: Tool = serde_json::from_value(request["operation"].clone())?;
+    let directory = request["directory"]
+        .as_str()
+        .context("missing approval directory")?;
+    let reason = request["justification"]
+        .as_str()
+        .context("missing approval reason")?;
+    let mut prompt = String::from("\nApproval required · unrestricted access\n\n");
+    // JSON quoting keeps paths on one line and makes unusual filenames explicit.
+    match tool {
+        Tool::ReadFile { path } => writeln!(prompt, "Read {}", serde_json::to_string(&path)?)?,
+        Tool::WriteFile { path, content } => {
+            writeln!(
+                prompt,
+                "Write {} (create or overwrite)",
+                serde_json::to_string(&path)?
+            )?;
+            approval_block(&mut prompt, "Full contents", &content);
+        }
+        Tool::EditFile { path, old, new } => {
+            writeln!(prompt, "Edit {}", serde_json::to_string(&path)?)?;
+            approval_block(&mut prompt, "Replace exactly one occurrence", &old);
+            approval_block(&mut prompt, "With", &new);
+        }
+        Tool::Shell { command } => approval_block(&mut prompt, "Run shell command", &command),
+    }
+    writeln!(
+        prompt,
+        "\nWorking directory: {}",
+        serde_json::to_string(directory)?
+    )?;
+    approval_block(&mut prompt, "Reason", reason);
+    prompt.push_str("\nThis operation will run WITHOUT the sandbox, with your user permissions.\n\nType allow (once), deny [default], or cancel: ");
+    Ok(prompt)
+}
+
+fn approval_block(output: &mut String, label: &str, text: &str) {
+    if !output.ends_with("\n\n") {
+        output.push('\n');
+    }
+    output.push_str(label);
+    output.push_str(":\n");
+    if text.is_empty() {
+        output.push_str("    (empty)\n");
+        return;
+    }
+    // Keep every line, indent untrusted text, and escape terminal controls.
+    for line in text.split('\n') {
+        output.push_str("    ");
+        for character in line.chars() {
+            if character.is_control() {
+                output.push_str(&character.escape_debug().to_string());
+            } else {
+                output.push(character);
+            }
+        }
+        output.push('\n');
+    }
+}
+
 pub struct Human;
 
 impl crate::permissions::Approver for Human {
@@ -208,11 +272,7 @@ impl crate::permissions::Approver for Human {
             eprintln!("Broader access denied: no interactive terminal is available.");
             return Ok(Decision::Deny);
         };
-        // JSON escaping prevents model-controlled terminal control sequences.
-        terminal.write(&format!(
-            "\nRun this operation WITHOUT the sandbox, with your user permissions?\n{}\nType allow (once), deny [default], or cancel: ",
-            serde_json::to_string_pretty(request)?
-        )).await?;
+        terminal.write(&approval_prompt(request)?).await?;
         let answer = terminal.read_line(32).await?.unwrap_or_default();
         Ok(match answer.trim() {
             "allow" => Decision::AllowOnce,
@@ -235,6 +295,46 @@ impl Terminal {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn approvals_show_full_operations_and_escape_terminal_controls() {
+        use serde_json::json;
+        let long_command = format!("echo '{}'\nprintf done", "x".repeat(200));
+        for (operation, expected) in [
+            (
+                json!({"name": "read_file", "arguments": {"path": "prefs.json"}}),
+                vec!["Read \"prefs.json\"".to_owned()],
+            ),
+            (
+                json!({"name": "shell", "arguments": {"command": long_command}}),
+                vec![format!("    echo '{}'\n    printf done", "x".repeat(200))],
+            ),
+            (
+                json!({"name": "write_file", "arguments": {"path": "file", "content": "first\n\nlast\n"}}),
+                vec![
+                    "(create or overwrite)".into(),
+                    "    first\n    \n    last\n    \n".into(),
+                ],
+            ),
+            (
+                json!({"name": "edit_file", "arguments": {"path": "file", "old": "before", "new": "after\x1b[31m"}}),
+                vec![
+                    "Replace exactly one occurrence:\n    before".into(),
+                    "With:\n    after\\u{1b}[31m".into(),
+                ],
+            ),
+        ] {
+            let prompt = approval_prompt(&json!({"operation": operation, "directory": "/project", "justification": "Requested\rby user"})).unwrap();
+            for text in expected {
+                assert!(prompt.contains(&text), "missing {text:?} in {prompt:?}");
+            }
+            assert!(prompt.contains("Working directory: \"/project\""));
+            assert!(prompt.contains("Requested\\rby user"));
+            assert!(prompt.contains("WITHOUT the sandbox"));
+            assert!(prompt.ends_with("Type allow (once), deny [default], or cancel: "));
+            assert!(!prompt.contains('\x1b'));
+        }
+    }
 
     #[test]
     fn tool_previews_are_bounded_single_line_and_escape_controls() {
