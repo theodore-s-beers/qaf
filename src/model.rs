@@ -1,10 +1,14 @@
 use anyhow::{Context, Result, bail, ensure};
 use serde::Deserialize;
 use serde_json::{Value, json};
-use std::{future::Future, time::Duration};
+use std::{future::Future, sync::RwLock, time::Duration};
 
 // The only abstraction: tests can supply scripted replies to the real agent loop.
 pub trait Model: Sync {
+    fn select_model(&self, _name: &str) -> impl Future<Output = Result<()>> + Send {
+        std::future::ready(Err(anyhow::anyhow!("model switching is unavailable")))
+    }
+
     fn respond(
         &self,
         history: &[Value],
@@ -16,7 +20,7 @@ pub struct Client {
     http: reqwest::Client,
     store: crate::auth::Store,
     account: String,
-    model: String,
+    model: RwLock<String>,
 }
 
 pub fn http_client() -> Result<reqwest::Client> {
@@ -33,8 +37,19 @@ impl Client {
             http: http_client()?,
             store,
             account,
-            model,
+            model: RwLock::new(model),
         })
+    }
+
+    fn remember_selection(&self, name: &str) -> Result<()> {
+        let mut selected = self
+            .model
+            .write()
+            .map_err(|_| anyhow::anyhow!("model selection lock poisoned"))?;
+        crate::preferences::remember_model(&self.store.directory().join("preferences.json"), name)?;
+        name.clone_into(&mut selected);
+        drop(selected);
+        Ok(())
     }
 
     pub async fn models(
@@ -82,13 +97,27 @@ fn request_body(model: &str, history: &[Value], tools: &[Value]) -> Value {
 }
 
 impl Model for Client {
+    async fn select_model(&self, name: &str) -> Result<()> {
+        let available = Self::models(&self.store, &self.account).await?;
+        ensure!(
+            available.iter().any(|(slug, _)| slug == name),
+            "model {name:?} is not in your account's catalog; run qaf models for choices"
+        );
+        self.remember_selection(name)
+    }
+
     async fn respond(&self, history: &[Value], tools: &[Value]) -> Result<Reply> {
         let token = self.store.access_token(&self.http, &self.account).await?;
+        let selected = self
+            .model
+            .read()
+            .map_err(|_| anyhow::anyhow!("model selection lock poisoned"))?
+            .clone();
         let response = self
             .http
             .post("https://api.openai.com/v1/responses")
             .bearer_auth(token)
-            .json(&request_body(&self.model, history, tools))
+            .json(&request_body(&selected, history, tools))
             .send()
             .await
             .context("request model response")?;
@@ -255,6 +284,38 @@ impl Reply {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn switching_remembers_selection_and_preserves_it_when_save_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("preferences.json");
+        std::fs::write(
+            &path,
+            r#"{"model":"first","approvals_reviewer":"auto_review"}"#,
+        )
+        .unwrap();
+        let client = Client::new(
+            crate::auth::Store::new(Some(dir.path().to_owned())).unwrap(),
+            "default".into(),
+            "first".into(),
+        )
+        .unwrap();
+        let reviewer_client = &client;
+        client.remember_selection("second").unwrap();
+        assert_eq!(*reviewer_client.model.read().unwrap(), "second");
+        assert_eq!(
+            crate::preferences::select_model(&path, None).unwrap(),
+            "second"
+        );
+        assert_eq!(
+            crate::preferences::reviewer(&path).unwrap(),
+            crate::preferences::Reviewer::AutoReview
+        );
+        std::fs::write(&path, "broken").unwrap();
+        assert!(client.remember_selection("third").is_err());
+        assert_eq!(*client.model.read().unwrap(), "second");
+        assert_eq!(std::fs::read_to_string(path).unwrap(), "broken");
+    }
 
     #[test]
     fn subscription_request_has_required_flags_and_namespaced_tools() {

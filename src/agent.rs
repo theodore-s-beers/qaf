@@ -36,6 +36,11 @@ impl Agent {
         }
     }
 
+    pub fn select_model(&mut self, name: &str) {
+        self.history[0] = json!({"role":"developer", "content":include_str!("../SYSTEM_PROMPT.md").replace("{{REQUESTED_MODEL}}", name)});
+        self.context.compacted(); // Token counts from the previous model no longer apply.
+    }
+
     pub fn context_tokens(&self) -> u64 {
         self.context.estimate(&self.history, &Tools::definitions())
     }

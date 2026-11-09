@@ -217,8 +217,9 @@ async fn interactive(
     approver: &impl permissions::Approver,
 ) -> Result<()> {
     terminal::status(format_args!(
-        "Enter a task. /context shows usage; /clear starts fresh; /exit or Ctrl-D exits. Ctrl-C stops the current task."
+        "Enter a task. /model switches models; /context shows usage; /clear starts fresh; /exit or Ctrl-D exits. Ctrl-C stops the current task."
     ));
+    let mut model_name = model_name.to_owned();
     let mut agent: Option<agent::Agent> = None;
     loop {
         eprintln!();
@@ -228,6 +229,44 @@ async fn interactive(
             terminal::Input::Eof => return Ok(()),
         };
         let prompt = line.trim();
+        if prompt.split_whitespace().next() == Some("/model") {
+            let words: Vec<_> = prompt.split_whitespace().collect();
+            match words.as_slice() {
+                [_] => terminal::status(format_args!(
+                    "Model: {model_name}. Use /model NAME to switch; run qaf models for choices."
+                )),
+                [_, name] if *name == model_name => {
+                    terminal::status(format_args!("Model: {model_name}"));
+                }
+                [_, name] => {
+                    let result = tokio::select! {
+                        result = model.select_model(name) => result,
+                        signal = tokio::signal::ctrl_c() => {
+                            signal.context("listen for Ctrl-C")?;
+                            Err(anyhow::anyhow!("interrupted"))
+                        }
+                    };
+                    match result {
+                        Ok(()) => {
+                            transcript
+                                .record("model_changed", &json!({"from":model_name,"to":name}))?;
+                            model_name = (*name).to_owned();
+                            if let Some(agent) = agent.as_mut() {
+                                agent.select_model(name);
+                            }
+                            terminal::status(format_args!("Model: {model_name}"));
+                        }
+                        Err(error) => {
+                            eprintln!(
+                                "Could not switch model; still using {model_name}: {error:#}"
+                            );
+                        }
+                    }
+                }
+                _ => eprintln!("Usage: /model [NAME]"),
+            }
+            continue;
+        }
         match prompt {
             "" => continue,
             "/exit" => return Ok(()),
@@ -247,7 +286,7 @@ async fn interactive(
                 continue;
             }
             _ if prompt.starts_with('/') && !prompt.contains(char::is_whitespace) => {
-                eprintln!("Unknown command. Use /context, /clear, or /exit.");
+                eprintln!("Unknown command. Use /model, /context, /clear, or /exit.");
                 continue;
             }
             _ => {}
@@ -255,7 +294,7 @@ async fn interactive(
         if let Some(agent) = agent.as_mut() {
             agent.add_prompt(prompt);
         }
-        let agent = agent.get_or_insert_with(|| agent::Agent::new(prompt, model_name));
+        let agent = agent.get_or_insert_with(|| agent::Agent::new(prompt, &model_name));
         if let Err(error) = task(agent, model, tools, transcript, max_turns, approver).await? {
             eprintln!(
                 "Task stopped: {error}\nYou can continue with another prompt, or /clear to start fresh."
@@ -315,47 +354,67 @@ mod tests {
     use super::*;
     use std::{collections::VecDeque, sync::Mutex};
 
+    struct Model(Mutex<Vec<Vec<serde_json::Value>>>, Mutex<String>);
+    impl model::Model for Model {
+        fn select_model(&self, name: &str) -> impl std::future::Future<Output = Result<()>> + Send {
+            std::future::ready(if name == "new-model" {
+                name.clone_into(&mut self.1.lock().unwrap());
+                Ok(())
+            } else {
+                Err(anyhow::anyhow!("unknown model"))
+            })
+        }
+
+        fn respond(
+            &self,
+            history: &[serde_json::Value],
+            _: &[serde_json::Value],
+        ) -> impl std::future::Future<Output = Result<model::Reply>> + Send {
+            assert!(
+                history[0]["content"]
+                    .as_str()
+                    .unwrap()
+                    .contains(&format!("`{}`", self.1.lock().unwrap()))
+            );
+            let mut inputs = self.0.lock().unwrap();
+            inputs.push(history.to_vec());
+            let fail = inputs.len() == 2;
+            drop(inputs);
+            std::future::ready(if fail {
+                Err(anyhow::anyhow!("test model failure"))
+            } else {
+                Ok(model::Reply {
+                    usage: None,
+                    output: vec![json!({"type":"message", "role":"assistant",
+                    "content":[{"type":"output_text","text":"Done"}]})],
+                })
+            })
+        }
+    }
+    struct Prompts(VecDeque<terminal::Input>);
+    impl terminal::PromptReader for Prompts {
+        fn read_prompt(
+            &mut self,
+        ) -> impl std::future::Future<Output = Result<terminal::Input>> + Send {
+            std::future::ready(Ok(self.0.pop_front().unwrap_or(terminal::Input::Eof)))
+        }
+    }
+
     #[tokio::test]
     async fn session_continues_after_errors_and_clear_resets_context() {
-        struct Model(Mutex<Vec<Vec<serde_json::Value>>>);
-        impl model::Model for Model {
-            fn respond(
-                &self,
-                history: &[serde_json::Value],
-                _: &[serde_json::Value],
-            ) -> impl std::future::Future<Output = Result<model::Reply>> + Send {
-                let mut inputs = self.0.lock().unwrap();
-                inputs.push(history.to_vec());
-                let fail = inputs.len() == 2;
-                drop(inputs);
-                std::future::ready(if fail {
-                    Err(anyhow::anyhow!("test model failure"))
-                } else {
-                    Ok(model::Reply {
-                        usage: None,
-                        output: vec![json!({"type":"message", "role":"assistant",
-                        "content":[{"type":"output_text","text":"Done"}]})],
-                    })
-                })
-            }
-        }
-        struct Prompts(VecDeque<terminal::Input>);
-        impl terminal::PromptReader for Prompts {
-            fn read_prompt(
-                &mut self,
-            ) -> impl std::future::Future<Output = Result<terminal::Input>> + Send {
-                std::future::ready(Ok(self.0.pop_front().unwrap_or(terminal::Input::Eof)))
-            }
-        }
         let root = tempfile::tempdir().unwrap();
         let tools = tools::Tools::for_test(root.path(), Duration::from_secs(1)).unwrap();
         let path = root.path().join("log");
         let mut transcript = transcript::Transcript::create(&path).unwrap();
-        let model = Model(Mutex::new(Vec::new()));
+        let model = Model(Mutex::new(Vec::new()), Mutex::new("session-model".into()));
         let mut terminal = Prompts(VecDeque::from([
             terminal::Input::Line("/context".into()),
             terminal::Input::Interrupted,
             terminal::Input::Line("first".into()),
+            terminal::Input::Line("/model".into()),
+            terminal::Input::Line("/model new-model".into()),
+            terminal::Input::Line("/model missing".into()),
+            terminal::Input::Line("/model too many args".into()),
             terminal::Input::Line("/context".into()),
             terminal::Input::Interrupted,
             terminal::Input::Line("followup".into()),
@@ -376,10 +435,14 @@ mod tests {
         .unwrap();
         let inputs = model.0.lock().unwrap();
         assert_eq!(inputs.len(), 3);
-        for input in inputs.iter() {
+        for (index, input) in inputs.iter().enumerate() {
             let instructions = input[0]["content"].as_str().unwrap();
             assert!(instructions.contains("qaf"));
-            assert!(instructions.contains("`session-model`"));
+            assert!(instructions.contains(if index == 0 {
+                "`session-model`"
+            } else {
+                "`new-model`"
+            }));
             assert!(!instructions.contains("{{REQUESTED_MODEL}}"));
         }
         assert_eq!(inputs[1][1]["content"], "first");
@@ -402,5 +465,14 @@ mod tests {
         );
         assert_eq!(records.iter().filter(|r| r["kind"] == "error").count(), 1);
         assert_eq!(records.iter().filter(|r| r["kind"] == "clear").count(), 1);
+        let changes: Vec<_> = records
+            .iter()
+            .filter(|r| r["kind"] == "model_changed")
+            .collect();
+        assert_eq!(changes.len(), 1);
+        assert_eq!(
+            changes[0]["data"],
+            json!({"from":"session-model","to":"new-model"})
+        );
     }
 }

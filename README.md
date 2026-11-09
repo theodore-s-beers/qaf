@@ -22,6 +22,7 @@ In a session, each prompt continues the conversation:
 
 - `/clear` starts fresh without undoing file changes.
 - `/context` shows approximate context usage.
+- `/model` shows the current model; `/model NAME` switches and remembers it, preserving the conversation. Auto-review uses the newly selected model too.
 - `/exit` or Ctrl-D exits.
 - Ctrl-C stops the current task, or discards input at the prompt.
 - Up/Down recall previous inputs.
