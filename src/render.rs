@@ -9,12 +9,8 @@ fn styled() -> bool {
         || std::env::var_os("TERM").is_some_and(|value| value == "dumb"))
 }
 
-pub fn response(source: &str) -> Cow<'_, str> {
-    if !styled() {
-        return Cow::Borrowed(source);
-    }
-    let width = terminal_size::terminal_size().map_or(80, |(width, _)| usize::from(width.0));
-    Cow::Owned(markdown(source, width))
+fn terminal_width() -> usize {
+    terminal_size::terminal_size().map_or(80, |(width, _)| usize::from(width.0))
 }
 
 // Render only stable top-level Markdown blocks. The unfinished final block stays
@@ -75,7 +71,7 @@ impl Stream {
         }
         let chunk = &self.source[self.emitted..end];
         let text = if self.styled {
-            response(chunk).trim_end().to_owned()
+            markdown(chunk, terminal_width()).trim_end().to_owned()
         } else {
             chunk.to_owned()
         };
@@ -96,6 +92,12 @@ impl Stream {
 }
 
 fn stable_end(source: &str) -> usize {
+    // A partial line (especially a lone table-row pipe) can look like a new
+    // block and then merge back into the preceding block as more text arrives.
+    let Some(end) = source.rfind('\n') else {
+        return 0;
+    };
+    let source = &source[..=end];
     let mut depth = 0;
     let mut last_start = 0;
     for (event, range) in Parser::new_ext(source, Options::ENABLE_TABLES).into_offset_iter() {
@@ -467,7 +469,7 @@ mod tests {
         assert_eq!(stream.push("let x = 1;\n\n"), "");
         assert_eq!(stream.emitted, emitted);
         assert_eq!(stream.push("```\n\n"), "");
-        assert_ne!(stream.push("Next paragraph"), "");
+        assert_ne!(stream.push("Next paragraph\n"), "");
         let remaining = stream.finish_partial();
         assert!(remaining.contains("Next paragraph"));
         assert_eq!(stream.finish_partial(), "");
@@ -567,9 +569,31 @@ mod tests {
         ] {
             assert_eq!(stream.push(chunk), "");
         }
-        assert_ne!(stream.push("After the table"), "");
+        assert_ne!(stream.push("After the table\n"), "");
         assert!(stream.source[..stream.emitted].contains("much longer title"));
         assert_eq!(stream.finish_partial().trim(), "After the table");
+    }
+
+    #[test]
+    fn streaming_partial_table_rows_match_complete_rendering() {
+        let source = "Intro.\n\n| Issue | Title |\n|---|---|\n| #12 | `alpha` |\n| #345 | **longer title** |\n\nAfter.\n";
+        for chunk_size in [1, 2, 3, 7, source.len()] {
+            let mut stream = Stream::new();
+            stream.styled = true;
+            let mut output = String::new();
+            for chunk in source.as_bytes().chunks(chunk_size) {
+                output.push_str(&stream.push(std::str::from_utf8(chunk).unwrap()));
+                let table_start = source.find("| Issue").unwrap();
+                let table_end = source.find("After.").unwrap();
+                assert!(
+                    stream.emitted <= table_start || stream.emitted >= table_end,
+                    "emitted part of the table at byte {} with chunk size {chunk_size}",
+                    stream.emitted
+                );
+            }
+            output.push_str(&stream.finish(source).unwrap());
+            assert_eq!(output.trim(), markdown(source, super::terminal_width()));
+        }
     }
 
     #[test]
