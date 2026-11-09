@@ -138,7 +138,7 @@ fn requires_human(request: &Value, config_directory: &Path) -> bool {
 
 async fn evaluate(model: &impl Model, evidence: &Value) -> Result<Verdict> {
     let input = [
-        json!({"role":"developer", "content":include_str!("../REVIEW_PROMPT.md")}),
+        json!({"role":"developer", "content":include_str!("../prompts/REVIEW_PROMPT.md")}),
         json!({"role":"user", "content":evidence.to_string()}),
     ];
     let reply = tokio::time::timeout(Duration::from_secs(60), model.respond(&input, &[]))

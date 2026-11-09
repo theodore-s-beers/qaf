@@ -24,8 +24,8 @@ pub struct Agent {
 
 impl Agent {
     pub fn new(prompt: &str, requested_model: &str) -> Self {
-        let instructions =
-            include_str!("../SYSTEM_PROMPT.md").replace("{{REQUESTED_MODEL}}", requested_model);
+        let instructions = include_str!("../prompts/SYSTEM_PROMPT.md")
+            .replace("{{REQUESTED_MODEL}}", requested_model);
         let mut review_history = crate::review::History::default();
         review_history.push(&json!({"role":"user", "content":prompt}));
         Self {
@@ -39,7 +39,7 @@ impl Agent {
     }
 
     pub fn select_model(&mut self, name: &str) {
-        self.history[0] = json!({"role":"developer", "content":include_str!("../SYSTEM_PROMPT.md").replace("{{REQUESTED_MODEL}}", name)});
+        self.history[0] = json!({"role":"developer", "content":include_str!("../prompts/SYSTEM_PROMPT.md").replace("{{REQUESTED_MODEL}}", name)});
         self.context.compacted(); // Token counts from the previous model no longer apply.
     }
 

@@ -67,7 +67,7 @@ To enable auto-review, add `approvals_reviewer` to `preferences.json` and restar
 
 The default is `"user"`. The optional `model_reviewer.name` selects a separate model from the same account’s catalog; omit it to follow the session model, including `/model` changes. Reasoning effort and Fast mode are independent for each role. Omit `reasoning_effort` to use the provider default; `fast` defaults to false and requests the priority service tier when true. Availability depends on the model and account. Legacy `model` and `reviewer_model` preferences are read and migrated when saving a model selection.
 
-Auto-review sends a separate request with `REVIEW_PROMPT.md`, conversation evidence, and the full operation, but no tools. Decisions and rationales are logged. Uncertainty, errors, and timeouts fall back to human approval; denied operations do not execute.
+Auto-review sends a separate request with `prompts/REVIEW_PROMPT.md`, conversation evidence, and the full operation, but no tools. Decisions and rationales are logged. Uncertainty, errors, and timeouts fall back to human approval; denied operations do not execute.
 
 Auto-review keeps readable evidence separately from the main model’s compacted context: verbatim user messages and recent assistant/tool activity. Omitted evidence is flagged. If user instructions exceed the review budget, approval falls back to you until `/clear`.
 
@@ -75,7 +75,7 @@ Direct writes to qaf's configuration require human approval. The reviewer policy
 
 ## Development
 
-`SYSTEM_PROMPT.md` and `REVIEW_PROMPT.md` are embedded at compile time; rebuild after editing either. The agent prompt's `{{REQUESTED_MODEL}}` placeholder is filled with the selected model identifier.
+`prompts/SYSTEM_PROMPT.md` and `prompts/REVIEW_PROMPT.md` are embedded at compile time; rebuild after editing either. The agent prompt's `{{REQUESTED_MODEL}}` placeholder is filled with the selected model identifier.
 
 ```sh
 cargo test
