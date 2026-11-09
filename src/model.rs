@@ -100,9 +100,29 @@ impl Client {
     }
 }
 
-fn request_body(model: &str, history: &[Value], tools: &[Value]) -> Value {
+async fn local_date() -> Result<String> {
+    let output = tokio::process::Command::new("/bin/date")
+        .arg("+%Y-%m-%d")
+        .env("LC_ALL", "C")
+        .kill_on_drop(true)
+        .output()
+        .await
+        .context("read local calendar date")?;
+    ensure!(
+        output.status.success(),
+        "could not read local calendar date"
+    );
+    let date = String::from_utf8(output.stdout).context("decode local date")?;
+    Ok(date.trim().to_owned())
+}
+
+fn request_body(model: &str, history: &[Value], tools: &[Value], date: &str) -> Value {
+    let mut input = vec![
+        json!({"role":"developer", "content":format!("Current local date: {date} (in the user's system timezone). Use this date when interpreting today; it takes precedence over a fallback current date.")}),
+    ];
+    input.extend_from_slice(history);
     json!({
-        "model": model, "input": history,
+        "model": model, "input": input,
         "tools": if tools.is_empty() { vec![] } else { vec![json!({"type": "namespace", "name": "qaf", "description": "Local coding tools", "tools": tools}), json!({"type":"web_search"})] },
         "store": false, "stream": true, "include": ["reasoning.encrypted_content"],
         "parallel_tool_calls": false,
@@ -136,11 +156,12 @@ impl Model for Client {
             .read()
             .map_err(|_| anyhow::anyhow!("model selection lock poisoned"))?
             .clone();
+        let date = local_date().await?;
         let response = self
             .http
             .post("https://api.openai.com/v1/responses")
             .bearer_auth(token)
-            .json(&request_body(&selected, history, tools))
+            .json(&request_body(&selected, history, tools, &date))
             .send()
             .await
             .context("request model response")?;
@@ -466,7 +487,16 @@ mod tests {
             "test-model",
             &[json!({"role":"user","content":"hello"})],
             &[json!({"type":"function","name":"read_file"})],
+            "2026-11-08",
         );
+        assert_eq!(body["input"][0]["role"], "developer");
+        assert!(
+            body["input"][0]["content"]
+                .as_str()
+                .unwrap()
+                .contains("Current local date: 2026-11-08")
+        );
+        assert_eq!(body["input"][1], json!({"role":"user","content":"hello"}));
         assert_eq!(body["stream"], true);
         assert_eq!(body["store"], false);
         assert_eq!(
@@ -477,7 +507,10 @@ mod tests {
         assert_eq!(body["tools"][0]["name"], "qaf");
         assert_eq!(body["tools"][0]["tools"][0]["name"], "read_file");
         assert_eq!(body["tools"][1]["type"], "web_search");
-        assert_eq!(request_body("reviewer", &[], &[])["tools"], json!([]));
+        assert_eq!(
+            request_body("reviewer", &[], &[], "2026-11-08")["tools"],
+            json!([])
+        );
         assert!(body.get("previous_response_id").is_none());
     }
 

@@ -27,7 +27,7 @@ In a session, each prompt continues the conversation:
 - Ctrl-C stops the current task, or discards input at the prompt.
 - Up/Down recall previous inputs.
 
-Conversation and input history last only for the current session. `--max-turns` applies separately to each task. Responses stream as completed Markdown blocks in the terminal; redirected output and `NO_COLOR` stream raw Markdown. Unfinished blocks are flushed when a task stops.
+Each model request includes the current date in your system’s timezone, without the time of day. Conversation and input history last only for the current session. `--max-turns` applies separately to each task. Responses stream as completed Markdown blocks in the terminal; redirected output and `NO_COLOR` stream raw Markdown. Unfinished blocks are flushed when a task stops.
 
 qaf requests server-side compaction at 230,000 tokens, leaving headroom within a 258,000-token working budget. This is not a hard input limit. Compaction replaces older conversation with encrypted state; the full transcript remains intact. Usage is approximate between responses and immediately after compaction.
 
