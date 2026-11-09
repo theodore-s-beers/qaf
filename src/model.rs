@@ -74,7 +74,7 @@ impl Client {
 fn request_body(model: &str, history: &[Value], tools: &[Value]) -> Value {
     json!({
         "model": model, "input": history,
-        "tools": [{"type": "namespace", "name": "qaf", "description": "Local coding tools", "tools": tools}],
+        "tools": if tools.is_empty() { vec![] } else { vec![json!({"type": "namespace", "name": "qaf", "description": "Local coding tools", "tools": tools})] },
         "store": false, "stream": true, "include": ["reasoning.encrypted_content"],
         "parallel_tool_calls": false,
     })

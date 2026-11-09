@@ -4,6 +4,7 @@ mod model;
 mod permissions;
 mod preferences;
 mod render;
+mod review;
 mod sandbox;
 mod terminal;
 mod tools;
@@ -81,36 +82,7 @@ async fn run() -> Result<()> {
     let args = Args::parse();
     let store = auth::Store::new(args.auth_dir)?;
     if let Some(command) = args.command {
-        let http = model::http_client()?;
-        return tokio::select! {
-            result = async {
-                match command {
-                    Command::Login { no_browser } => {
-                        store.login(&http, &args.account, no_browser).await?;
-                        println!("Signed in as {}. Run qaf models to see available models.", args.account);
-                        Ok(())
-                    }
-                    Command::Logout => store.logout(&http, &args.account).await,
-                    Command::Status => store.status(),
-                    Command::SandboxCheck => {
-                        let sandbox = sandbox::Sandbox::new(&args.directory, store.directory(), &std::env::current_exe()?)?;
-                        sandbox.check().await?;
-                        println!("Sandbox ready: project writes, private scratch, no network.");
-                        Ok(())
-                    }
-                    Command::Models => {
-                        for (slug, name) in model::Client::models(&store, &args.account).await? {
-                            println!("{slug}\t{name}");
-                        }
-                        Ok(())
-                    }
-                }
-            } => result,
-            signal = tokio::signal::ctrl_c() => {
-                signal.context("listen for Ctrl-C")?;
-                bail!("interrupted");
-            }
-        };
+        return run_command(command, &store, &args.account, &args.directory).await;
     }
     let terminal = if args.prompt.is_none() {
         anyhow::ensure!(
@@ -136,7 +108,15 @@ async fn run() -> Result<()> {
         store.directory(),
     )
     .await?;
+    let config_directory = store.directory().to_owned();
+    let reviewer = preferences::reviewer(&preferences_path)?;
     let model = model::Client::new(store, args.account.clone(), model_name.clone())?;
+    let approver = review::Approval {
+        mode: reviewer,
+        model: &model,
+        human: &terminal::Human,
+        config_directory: &config_directory,
+    };
     let path = args.transcript.unwrap_or_else(|| {
         let stamp = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -147,18 +127,32 @@ async fn run() -> Result<()> {
     let mut transcript = transcript::Transcript::create(&path)?;
     transcript.record(
         "start",
-        &json!({"model": model_name, "account": args.account, "directory": tools.directory(), "max_turns": args.max_turns, "interactive": terminal.is_some()}),
+        &json!({"model": model_name, "account": args.account, "directory": tools.directory(), "max_turns": args.max_turns, "interactive": terminal.is_some(), "approvals_reviewer": reviewer}),
     )?;
     if args.model.is_some() {
         preferences::remember_model(&preferences_path, &model_name)?;
     }
     terminal::status(format_args!("Model: {model_name}"));
+    terminal::status(format_args!(
+        "Approvals: {}",
+        match reviewer {
+            preferences::Reviewer::User => "human",
+            preferences::Reviewer::AutoReview => "auto-review",
+        }
+    ));
     terminal::status(format_args!("Transcript: {}", path.display()));
     if let Some(prompt) = args.prompt {
         let mut agent = agent::Agent::new(&prompt, &model_name);
-        task(&mut agent, &model, &tools, &mut transcript, args.max_turns)
-            .await?
-            .map_err(anyhow::Error::msg)?;
+        task(
+            &mut agent,
+            &model,
+            &tools,
+            &mut transcript,
+            args.max_turns,
+            &approver,
+        )
+        .await?
+        .map_err(anyhow::Error::msg)?;
     } else if let Some(mut terminal) = terminal {
         interactive(
             &mut terminal,
@@ -167,10 +161,49 @@ async fn run() -> Result<()> {
             &mut transcript,
             args.max_turns,
             &model_name,
+            &approver,
         )
         .await?;
     }
     transcript.record("finished", &json!({}))
+}
+
+async fn run_command(
+    command: Command,
+    store: &auth::Store,
+    account: &str,
+    directory: &std::path::Path,
+) -> Result<()> {
+    let http = model::http_client()?;
+    tokio::select! {
+        result = async {
+            match command {
+                Command::Login { no_browser } => {
+                    store.login(&http, account, no_browser).await?;
+                    println!("Signed in as {account}. Run qaf models to see available models.");
+                    Ok(())
+                }
+                Command::Logout => store.logout(&http, account).await,
+                Command::Status => store.status(),
+                Command::SandboxCheck => {
+                    let sandbox = sandbox::Sandbox::new(directory, store.directory(), &std::env::current_exe()?)?;
+                    sandbox.check().await?;
+                    println!("Sandbox ready: project writes, private scratch, no network.");
+                    Ok(())
+                }
+                Command::Models => {
+                    for (slug, name) in model::Client::models(store, account).await? {
+                        println!("{slug}\t{name}");
+                    }
+                    Ok(())
+                }
+            }
+        } => result,
+        signal = tokio::signal::ctrl_c() => {
+            signal.context("listen for Ctrl-C")?;
+            bail!("interrupted");
+        }
+    }
 }
 
 async fn interactive(
@@ -180,6 +213,7 @@ async fn interactive(
     transcript: &mut transcript::Transcript,
     max_turns: u32,
     model_name: &str,
+    approver: &impl permissions::Approver,
 ) -> Result<()> {
     terminal::status(format_args!(
         "Enter a task. /clear starts fresh; /exit or Ctrl-D exits. Ctrl-C stops the current task."
@@ -212,7 +246,7 @@ async fn interactive(
             agent.add_prompt(prompt);
         }
         let agent = agent.get_or_insert_with(|| agent::Agent::new(prompt, model_name));
-        if let Err(error) = task(agent, model, tools, transcript, max_turns).await? {
+        if let Err(error) = task(agent, model, tools, transcript, max_turns, approver).await? {
             eprintln!(
                 "Task stopped: {error}\nYou can continue with another prompt, or /clear to start fresh."
             );
@@ -227,10 +261,11 @@ async fn task(
     tools: &tools::Tools,
     transcript: &mut transcript::Transcript,
     max_turns: u32,
+    approver: &impl permissions::Approver,
 ) -> Result<Result<(), String>> {
     let mut showing_tools = false;
     let result = tokio::select! {
-        result = agent.run(model, tools, transcript, max_turns, &terminal::Human, |event| {
+        result = agent.run(model, tools, transcript, max_turns, approver, |event| {
             match event {
                 agent::Event::Text(text) => {
                     println!("\n{}", render::response(text));
@@ -318,6 +353,7 @@ mod tests {
             &mut transcript,
             1,
             "session-model",
+            &terminal::Human,
         )
         .await
         .unwrap();

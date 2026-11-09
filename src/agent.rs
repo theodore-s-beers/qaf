@@ -86,27 +86,32 @@ impl Agent {
                 transcript.record("tool_start", &json!({"call_id": call.call_id, "name": call.name, "arguments": call.arguments}))?;
                 let output = match Request::parse(&call.name, &call.arguments) {
                     Ok(request) => {
-                        let decision = if request.access == Access::Unrestricted {
+                        let review = if request.access == Access::Unrestricted {
                             let mut description = request.description(tools.directory());
                             description["call_id"] = json!(call.call_id);
                             transcript.record("approval_request", &description)?;
                             emit(Event::Approval);
-                            let decision = approver.approve(&description).await?;
+                            let review = approver
+                                .review(&description, &self.history, transcript)
+                                .await?;
                             transcript.record(
                                 "approval_decision",
-                                &json!({"call_id": call.call_id, "decision": decision}),
+                                &json!({"call_id": call.call_id, "decision": review.decision, "rationale": review.rationale}),
                             )?;
-                            decision
+                            review
                         } else {
-                            Decision::AllowOnce
+                            crate::permissions::Review {
+                                decision: Decision::AllowOnce,
+                                rationale: String::new(),
+                            }
                         };
-                        match decision {
+                        match review.decision {
                             Decision::AllowOnce => {
                                 emit(Event::Tool(&request.tool));
                                 tools.run(&request).await
                             }
                             Decision::Deny => {
-                                json!({"error": "User denied broader access. Do not retry the same operation without new authorization."})
+                                json!({"error": "Broader access denied. Do not work around this denial. Choose a materially safer alternative or ask the user.", "reason": review.rationale})
                             }
                             Decision::Cancel => bail!("run cancelled during approval"),
                         }
@@ -165,6 +170,57 @@ mod tests {
 
     fn answer() -> Value {
         json!({"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "Fixed and verified."}]})
+    }
+
+    #[tokio::test]
+    async fn auto_review_gates_execution_and_reports_denials() {
+        for allowed in [true, false] {
+            let dir = tempfile::tempdir().unwrap();
+            let tools = Tools::for_test(dir.path(), Duration::from_secs(5)).unwrap();
+            let path = dir.path().join("transcript.jsonl");
+            let mut transcript = Transcript::create(&path).unwrap();
+            let verdict = if allowed { "allow" } else { "deny" };
+            let model = Scripted::new(vec![
+                vec![call(
+                    "c1",
+                    "shell",
+                    &json!({"command":"printf reviewed > result.txt", "access":"unrestricted", "justification":"Requested file"}),
+                )],
+                vec![
+                    json!({"type":"message", "content":[{"type":"output_text", "text":json!({"decision":verdict, "rationale":"Review explanation"}).to_string()}]}),
+                ],
+                vec![answer()],
+            ]);
+            let approver = crate::review::Approval {
+                mode: crate::preferences::Reviewer::AutoReview,
+                model: &model,
+                human: &crate::permissions::Deny,
+                config_directory: dir.path(),
+            };
+            Agent::new("Create result.txt", "test")
+                .run(&model, &tools, &mut transcript, 2, &approver, |_| {})
+                .await
+                .unwrap();
+            assert_eq!(dir.path().join("result.txt").exists(), allowed);
+            let requests = model.requests.lock().unwrap();
+            let tool_result = requests[2]
+                .iter()
+                .find(|item| item["type"] == "function_call_output")
+                .unwrap();
+            if !allowed {
+                assert!(
+                    tool_result["output"]
+                        .as_str()
+                        .unwrap()
+                        .contains("Review explanation")
+                );
+            }
+            drop(requests);
+            let log = std::fs::read_to_string(path).unwrap();
+            assert!(log.contains("auto_review_request"));
+            assert!(log.contains("auto_review_result"));
+            assert!(log.contains("approval_decision"));
+        }
     }
 
     #[tokio::test]

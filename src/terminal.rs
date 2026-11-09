@@ -20,6 +20,31 @@ pub fn status(message: std::fmt::Arguments<'_>) {
     }
 }
 
+pub fn review_status(label: &str, reason: &str) {
+    let width = terminal_size::terminal_size_of(std::io::stderr())
+        .map_or(80, |(width, _)| usize::from(width.0));
+    status(format_args!("{}", review_message(label, reason, width)));
+}
+
+fn review_message(label: &str, reason: &str, width: usize) -> String {
+    let safe: String = reason
+        .chars()
+        .map(|character| {
+            if character.is_control() {
+                character.escape_debug().to_string()
+            } else {
+                character.to_string()
+            }
+        })
+        .collect();
+    textwrap::fill(
+        &format!("{label}: {safe}"),
+        textwrap::Options::new(width.max(5))
+            .subsequent_indent("    ")
+            .break_words(false),
+    )
+}
+
 /// A bounded display preview; execution and approval retain the full arguments.
 pub fn tool_preview(tool: &crate::tools::Tool) -> String {
     use crate::tools::Tool;
@@ -309,6 +334,22 @@ impl Terminal {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn review_messages_wrap_and_escape_controls_without_quoting() {
+        assert_eq!(
+            review_message(
+                "Auto-review allowed",
+                "Read the requested preferences file.",
+                40
+            ),
+            "Auto-review allowed: Read the requested\n    preferences file."
+        );
+        assert_eq!(
+            review_message("Auto-review denied", "don't run \x1b[31m", 80),
+            "Auto-review denied: don't run \\u{1b}[31m"
+        );
+    }
 
     #[test]
     fn approvals_show_full_operations_and_escape_terminal_controls() {

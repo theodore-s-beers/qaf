@@ -63,7 +63,27 @@ pub enum Decision {
     Cancel,
 }
 
+#[derive(Serialize)]
+pub struct Review {
+    pub decision: Decision,
+    pub rationale: String,
+}
+
 pub trait Approver: Sync {
+    fn review(
+        &self,
+        request: &Value,
+        _history: &[Value],
+        _transcript: &mut crate::transcript::Transcript,
+    ) -> impl Future<Output = Result<Review>> + Send {
+        async {
+            Ok(Review {
+                decision: self.approve(request).await?,
+                rationale: "Human approval decision".into(),
+            })
+        }
+    }
+
     fn approve(&self, request: &Value) -> impl Future<Output = Result<Decision>> + Send;
 }
 

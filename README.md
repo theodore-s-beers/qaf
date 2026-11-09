@@ -31,7 +31,20 @@ Credentials are stored with owner-only permissions in `~/.config/qaf/auth.json` 
 
 The agent can read, write, and edit files and run shell commands. Tools run in an OS sandbox: reads are broadly allowed, writes are limited to the project and temporary scratch space, and network access is blocked. The qaf configuration directory (including preferences and credentials) is inaccessible to sandboxed tools; existing project `.git` and `.jj` directories are read-only. Ctrl-C interrupts the current task.
 
-For broader access, the agent must request unrestricted execution with a justification. qaf shows the operation in your terminal: type `allow` to approve that one operation, `deny` (the default) to reject it, or `cancel` to stop the current task. Approval permits execution with your user's permissions, including access to qaf's configuration directory; it bypasses the sandbox entirely. Without an interactive terminal, requests are denied. Failed sandboxed operations are never automatically retried unrestricted.
+For broader access, the agent must request unrestricted execution with a justification. qaf shows the operation in your terminal: type `allow` to approve that one operation, `deny` (the default) to reject it, or `cancel` to stop the current task. Approval permits execution with your user's permissions, including access to qaf's configuration directory; it bypasses the sandbox entirely. Without an interactive terminal, requests that need human approval are denied. Failed sandboxed operations are never automatically retried unrestricted.
+
+To opt into automatic approval review, add `"approvals_reviewer": "auto_review"` to `preferences.json` and restart qaf:
+
+```json
+{
+  "model": "YOUR_MODEL",
+  "approvals_reviewer": "auto_review"
+}
+```
+
+The default reviewer is `"user"`. Auto-review uses the same selected model, in a separate request with its own system prompt (`REVIEW_PROMPT.md`). The reviewer model sees conversation evidence and the full proposed operation; it has no tools. Decisions and reasoning are recorded in the session transcript. Uncertain reviews, errors, and timeouts fall back to human approval. Denials return the reason to the agent without executing the operation.
+
+Direct writes to qaf's configuration require human approval; the reviewer policy also requires human review for indirect changes to qaf's approval settings or implementation. Model review is a judgment, not an OS security boundary; approved operations still bypass the sandbox. Preferences are read at startup, and selecting a model preserves other settings.
 
 macOS uses the built-in `/usr/bin/sandbox-exec`. Linux (x86-64 or ARM64) requires `bubblewrap` and enabled user namespaces; distribution security settings may restrict these. Check availability with `cargo run -- -C /path/to/project sandbox-check`. qaf refuses to run tools if the sandbox cannot start.
 
@@ -47,6 +60,7 @@ Run `cargo run -- --help` for options.
 - `src/terminal.rs`: terminal input, output, and human approvals.
 - `src/auth.rs`: ChatGPT login, credentials, and token refresh.
 - `src/agent.rs`: conversation history and the model/tool loop.
+- `src/review.rs`: automatic approval review and human fallback.
 - `src/render.rs`: terminal Markdown presentation.
 - `src/model.rs`: OpenAI Responses API integration.
 - `src/tools.rs`: file and shell tools.
