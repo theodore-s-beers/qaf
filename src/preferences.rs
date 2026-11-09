@@ -28,47 +28,73 @@ pub fn reviewer(path: &Path) -> Result<Reviewer> {
     }
 }
 
-pub fn reviewer_model(path: &Path) -> Result<Option<String>> {
-    #[derive(Deserialize)]
-    struct Selection {
-        reviewer_model: Option<String>,
-    }
-    let bytes = match std::fs::read(path) {
-        Ok(bytes) => bytes,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => return Err(error.into()),
-    };
-    let selection: Selection =
-        serde_json::from_slice(&bytes).context("read reviewer_model preference")?;
-    if let Some(name) = &selection.reviewer_model {
-        ensure!(
-            !name.trim().is_empty() && !name.contains(char::is_whitespace),
-            "reviewer_model must be a nonempty model identifier"
-        );
-    }
-    Ok(selection.reviewer_model)
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ModelSettings {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort: Option<String>,
+    #[serde(default)]
+    pub fast: bool,
 }
 
-#[derive(Deserialize, Serialize)]
-struct Preferences {
-    model: String,
-    #[serde(default)]
-    approvals_reviewer: Reviewer,
+pub fn model_settings(path: &Path, role: &str) -> Result<ModelSettings> {
+    let bytes = match std::fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(ModelSettings::default());
+        }
+        Err(error) => return Err(error.into()),
+    };
+    let value: serde_json::Value = serde_json::from_slice(&bytes).context("read preferences")?;
+    let legacy = if role == "model_primary" {
+        "model"
+    } else {
+        "reviewer_model"
+    };
+    let settings: ModelSettings = if let Some(value) = value.get(role) {
+        serde_json::from_value(value.clone()).with_context(|| format!("read {role}"))?
+    } else {
+        ModelSettings {
+            name: value
+                .get(legacy)
+                .map(|v| serde_json::from_value::<Option<String>>(v.clone()))
+                .transpose()?
+                .flatten(),
+            ..ModelSettings::default()
+        }
+    };
+    if let Some(name) = &settings.name {
+        ensure!(
+            !name.is_empty() && !name.contains(char::is_whitespace),
+            "{role}.name must be a nonempty model identifier"
+        );
+    }
+    if let Some(effort) = &settings.reasoning_effort {
+        ensure!(
+            [
+                "none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"
+            ]
+            .contains(&effort.as_str()),
+            "invalid {role}.reasoning_effort"
+        );
+    }
+    Ok(settings)
+}
+
+#[cfg(test)]
+fn reviewer_model(path: &Path) -> Result<Option<String>> {
+    Ok(model_settings(path, "model_reviewer")?.name)
 }
 
 pub fn select_model(path: &Path, explicit: Option<&str>) -> Result<String> {
     let model = if let Some(model) = explicit {
         model.to_owned()
     } else {
-        let bytes = std::fs::read(path).with_context(|| {
-            format!(
-                "read {}; choose --model or set OPENAI_MODEL; run qaf models for choices",
-                path.display()
-            )
-        })?;
-        serde_json::from_slice::<Preferences>(&bytes)
-            .context("read saved model preference; use --model to replace it")?
-            .model
+        model_settings(path, "model_primary")?
+            .name
+            .context("choose --model or set OPENAI_MODEL; run qaf models for choices")?
     };
     ensure!(!model.trim().is_empty(), "model must not be empty");
     Ok(model)
@@ -91,7 +117,24 @@ pub fn remember_model(path: &Path, model: &str) -> Result<()> {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => serde_json::Map::new(),
         Err(error) => return Err(error.into()),
     };
-    preferences.insert("model".into(), serde_json::json!(model));
+    // Migrate legacy selections while retaining unknown top-level preferences.
+    for (role, legacy) in [
+        ("model_primary", "model"),
+        ("model_reviewer", "reviewer_model"),
+    ] {
+        let settings = model_settings(path, role)?;
+        if preferences.contains_key(role) || settings.name.is_some() {
+            preferences.insert(role.into(), serde_json::to_value(settings)?);
+        }
+        preferences.remove(legacy);
+    }
+    let primary = preferences
+        .entry("model_primary")
+        .or_insert_with(|| serde_json::json!({}));
+    primary
+        .as_object_mut()
+        .context("model_primary must be an object")?
+        .insert("name".into(), serde_json::json!(model));
     serde_json::to_writer(&mut file, &preferences)?;
     file.flush()?;
     file.persist(path).context("save model preference")?;
@@ -101,6 +144,30 @@ pub fn remember_model(path: &Path, model: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn nested_settings_survive_model_switches() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("preferences.json");
+        let value = serde_json::json!({
+            "model_primary": {"name":"first", "reasoning_effort":"medium", "fast":false},
+            "model_reviewer": {"name":"reviewer", "fast":true},
+            "custom": "preserved"
+        });
+        std::fs::write(&path, value.to_string()).unwrap();
+        remember_model(&path, "second").unwrap();
+        let primary = model_settings(&path, "model_primary").unwrap();
+        let reviewer = model_settings(&path, "model_reviewer").unwrap();
+        assert_eq!(primary.name.as_deref(), Some("second"));
+        assert_eq!(primary.reasoning_effort.as_deref(), Some("medium"));
+        assert!(!primary.fast);
+        assert!(reviewer.fast);
+        assert!(reviewer.reasoning_effort.is_none());
+        let saved: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(saved["custom"], "preserved");
+        assert!(saved.get("model").is_none());
+    }
 
     #[test]
     fn model_selection_preserves_review_settings_and_rejects_corrupt_saves() {

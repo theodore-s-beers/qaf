@@ -1,7 +1,12 @@
 use anyhow::{Context, Result, bail, ensure};
 use serde::Deserialize;
 use serde_json::{Value, json};
-use std::{collections::BTreeMap, future::Future, sync::RwLock, time::Duration};
+use std::{
+    collections::BTreeMap,
+    future::Future,
+    sync::{Arc, RwLock},
+    time::Duration,
+};
 
 pub enum Progress<'a> {
     Text(&'a str),
@@ -34,7 +39,8 @@ pub struct Client {
     http: reqwest::Client,
     store: crate::auth::Store,
     account: String,
-    model: RwLock<String>,
+    model: Arc<RwLock<String>>,
+    settings: crate::preferences::ModelSettings,
 }
 
 pub fn http_client() -> Result<reqwest::Client> {
@@ -51,8 +57,40 @@ impl Client {
             http: http_client()?,
             store,
             account,
-            model: RwLock::new(model),
+            model: Arc::new(RwLock::new(model)),
+            settings: crate::preferences::ModelSettings::default(),
         })
+    }
+
+    pub fn with_settings(mut self, settings: crate::preferences::ModelSettings) -> Self {
+        self.settings = settings;
+        self
+    }
+
+    pub fn reviewer(&self, settings: crate::preferences::ModelSettings) -> Self {
+        Self {
+            http: self.http.clone(),
+            store: self.store.clone(),
+            account: self.account.clone(),
+            model: settings.name.as_ref().map_or_else(
+                || Arc::clone(&self.model),
+                |name| Arc::new(RwLock::new(name.clone())),
+            ),
+            settings,
+        }
+    }
+
+    fn body(&self, model: &str, history: &[Value], tools: &[Value], date: &str) -> Value {
+        let mut body = request_body(model, history, tools, date);
+        if let Some(effort) = &self.settings.reasoning_effort {
+            body["reasoning"] = json!({"effort": effort});
+        }
+        body["service_tier"] = json!(if self.settings.fast {
+            "priority"
+        } else {
+            "default"
+        });
+        body
     }
 
     fn remember_selection(&self, name: &str) -> Result<()> {
@@ -157,11 +195,12 @@ impl Model for Client {
             .map_err(|_| anyhow::anyhow!("model selection lock poisoned"))?
             .clone();
         let date = local_date().await?;
+        let body = self.body(&selected, history, tools, &date);
         let response = self
             .http
             .post("https://api.openai.com/v1/responses")
             .bearer_auth(token)
-            .json(&request_body(&selected, history, tools, &date))
+            .json(&body)
             .send()
             .await
             .context("request model response")?;
@@ -463,10 +502,28 @@ mod tests {
             "review-model".into(),
         )
         .unwrap();
-        let reviewer_client = &client;
+        let reviewer_client = client.reviewer(crate::preferences::ModelSettings {
+            fast: true,
+            ..Default::default()
+        });
+        let primary_body = client.body("first", &[], &[], "2026-11-09");
+        let reviewer_body = reviewer_client.body("first", &[], &[], "2026-11-09");
+        assert_eq!(primary_body["service_tier"], "default");
+        assert_eq!(reviewer_body["service_tier"], "priority");
+        assert!(reviewer_body.get("reasoning").is_none());
+        let configured = client.reviewer(crate::preferences::ModelSettings {
+            name: Some("fixed".into()),
+            reasoning_effort: Some("medium".into()),
+            fast: false,
+        });
+        assert_eq!(
+            configured.body("fixed", &[], &[], "2026-11-09")["reasoning"]["effort"],
+            "medium"
+        );
         client.remember_selection("second").unwrap();
         assert_eq!(*reviewer_client.model.read().unwrap(), "second");
         assert_eq!(*pinned.model.read().unwrap(), "review-model");
+        assert_eq!(*configured.model.read().unwrap(), "fixed");
         assert_eq!(
             crate::preferences::select_model(&path, None).unwrap(),
             "second"

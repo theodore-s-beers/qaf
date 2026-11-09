@@ -111,15 +111,15 @@ async fn run() -> Result<()> {
     .await?;
     let config_directory = store.directory().to_owned();
     let reviewer = preferences::reviewer(&preferences_path)?;
-    let reviewer_name = preferences::reviewer_model(&preferences_path)?;
-    let reviewer_model = reviewer_name
-        .as_ref()
-        .map(|name| model::Client::new(store.clone(), args.account.clone(), name.clone()))
-        .transpose()?;
-    let model = model::Client::new(store, args.account.clone(), model_name.clone())?;
+    let primary_settings = preferences::model_settings(&preferences_path, "model_primary")?;
+    let reviewer_settings = preferences::model_settings(&preferences_path, "model_reviewer")?;
+    let reviewer_name = reviewer_settings.name.clone();
+    let model = model::Client::new(store, args.account.clone(), model_name.clone())?
+        .with_settings(primary_settings.clone());
+    let reviewer_model = model.reviewer(reviewer_settings.clone());
     let approver = review::Approval {
         mode: reviewer,
-        model: reviewer_model.as_ref().unwrap_or(&model),
+        model: &reviewer_model,
         human: &terminal::Human,
         config_directory: &config_directory,
     };
@@ -133,25 +133,12 @@ async fn run() -> Result<()> {
     let mut transcript = transcript::Transcript::create(&path)?;
     transcript.record(
         "start",
-        &json!({"model": model_name, "account": args.account, "directory": tools.directory(), "max_turns": args.max_turns, "interactive": terminal.is_some(), "approvals_reviewer": reviewer, "reviewer_model":reviewer_name}),
+        &json!({"model": model_name, "account": args.account, "directory": tools.directory(), "max_turns": args.max_turns, "interactive": terminal.is_some(), "approvals_reviewer": reviewer, "reviewer_model":reviewer_name, "model_primary":primary_settings, "model_reviewer":reviewer_settings}),
     )?;
     if args.model.is_some() {
         preferences::remember_model(&preferences_path, &model_name)?;
     }
-    terminal::status(format_args!("Model: {model_name}"));
-    terminal::status(format_args!(
-        "Approvals: {}",
-        match reviewer {
-            preferences::Reviewer::User => "human",
-            preferences::Reviewer::AutoReview => "auto-review",
-        }
-    ));
-    if reviewer == preferences::Reviewer::AutoReview {
-        terminal::status(format_args!(
-            "Reviewer model: {}",
-            reviewer_name.as_deref().unwrap_or("follows session model")
-        ));
-    }
+    show_models(&model_name, &primary_settings, reviewer, &reviewer_settings);
     terminal::status(format_args!("Transcript: {}", path.display()));
     if let Some(prompt) = args.prompt {
         let mut agent = agent::Agent::new(&prompt, &model_name);
@@ -178,6 +165,43 @@ async fn run() -> Result<()> {
         .await?;
     }
     transcript.record("finished", &json!({}))
+}
+
+fn show_models(
+    model_name: &str,
+    primary_settings: &preferences::ModelSettings,
+    reviewer: preferences::Reviewer,
+    reviewer_settings: &preferences::ModelSettings,
+) {
+    terminal::status(format_args!(
+        "Model: {model_name} (reasoning: {}; fast requested: {})",
+        primary_settings
+            .reasoning_effort
+            .as_deref()
+            .unwrap_or("default"),
+        primary_settings.fast
+    ));
+    terminal::status(format_args!(
+        "Approvals: {}",
+        match reviewer {
+            preferences::Reviewer::User => "human",
+            preferences::Reviewer::AutoReview => "auto-review",
+        }
+    ));
+    if reviewer == preferences::Reviewer::AutoReview {
+        terminal::status(format_args!(
+            "Reviewer model: {} (reasoning: {}; fast requested: {})",
+            reviewer_settings
+                .name
+                .as_deref()
+                .unwrap_or("follows session model"),
+            reviewer_settings
+                .reasoning_effort
+                .as_deref()
+                .unwrap_or("default"),
+            reviewer_settings.fast
+        ));
+    }
 }
 
 async fn run_command(
