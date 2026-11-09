@@ -8,6 +8,19 @@ use std::{
     time::Duration,
 };
 
+/// Format a count with comma separators for terminal output.
+pub fn number(value: u64) -> String {
+    let digits = value.to_string();
+    let mut formatted = String::new();
+    for (index, digit) in digits.chars().enumerate() {
+        if index > 0 && (digits.len() - index).is_multiple_of(3) {
+            formatted.push(',');
+        }
+        formatted.push(digit);
+    }
+    formatted
+}
+
 /// Print secondary information using the terminal's dim style when available.
 pub fn status(message: std::fmt::Arguments<'_>) {
     let dim = std::io::stderr().is_terminal()

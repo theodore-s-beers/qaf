@@ -284,9 +284,9 @@ async fn interactive(
             "/context" => {
                 terminal::status(format_args!(
                     "Context: approximately {} / {} tokens; auto-compaction at {}.",
-                    agent.as_ref().map_or(0, agent::Agent::context_tokens),
-                    context::WINDOW,
-                    context::COMPACT_AT
+                    terminal::number(agent.as_ref().map_or(0, agent::Agent::context_tokens)),
+                    terminal::number(context::WINDOW),
+                    terminal::number(context::COMPACT_AT)
                 ));
                 continue;
             }
@@ -311,6 +311,14 @@ async fn interactive(
                 "Task stopped: {error}\nYou can continue with another prompt, or /clear to start fresh."
             );
         }
+        let tokens = agent.context_tokens();
+        let percent = (u128::from(tokens) * 100 + u128::from(context::WINDOW) / 2)
+            / u128::from(context::WINDOW);
+        terminal::status(format_args!(
+            "\nContext: ~{} / {} tokens ({percent}%)",
+            terminal::number(tokens),
+            terminal::number(context::WINDOW)
+        ));
     }
 }
 
