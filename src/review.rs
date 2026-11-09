@@ -196,7 +196,7 @@ mod tests {
     impl Approver for Human {
         fn approve(&self, _: &Value) -> impl std::future::Future<Output = Result<Decision>> + Send {
             self.0.fetch_add(1, Ordering::SeqCst);
-            std::future::ready(Ok(Decision::Deny))
+            std::future::ready(Ok(Decision::Cancel))
         }
     }
 
@@ -255,13 +255,22 @@ mod tests {
                 .await
                 .unwrap();
             assert_eq!(matches!(review.decision, Decision::AllowOnce), allowed);
-            assert_eq!(human.0.load(Ordering::SeqCst), human_calls);
+            assert_eq!(human.0.load(Ordering::SeqCst), human_calls, "{response}");
+            assert_eq!(
+                matches!(review.decision, Decision::Cancel),
+                human_calls == 1,
+                "human decision must propagate: {response}"
+            );
+            if human_calls == 0 {
+                let expected: Value = serde_json::from_str(response).unwrap();
+                assert_eq!(review.rationale, expected["rationale"].as_str().unwrap());
+            }
             let inputs = model.inputs.lock().unwrap();
             assert_eq!(inputs[0].len(), 2);
             let context: Value =
                 serde_json::from_str(inputs[0][1]["content"].as_str().unwrap()).unwrap();
             drop(inputs);
-            assert_eq!(context["conversation"].as_array().unwrap().len(), 2);
+            assert_eq!(context["conversation"], json!([history[2], history[3]]));
             assert_eq!(context["request"], request);
         }
     }
@@ -275,31 +284,48 @@ mod tests {
         };
         let human = Human(AtomicUsize::new(0));
         let mut transcript = Transcript::create(&dir.path().join("log.jsonl")).unwrap();
-        for mode in [Reviewer::User, Reviewer::AutoReview] {
+        std::fs::create_dir(dir.path().join("config")).unwrap();
+        std::os::unix::fs::symlink(dir.path().join("config"), dir.path().join("alias")).unwrap();
+        let config_directory = dir.path().join("config");
+        // Use an ordinary command for manual mode so the protected-write rule
+        // cannot accidentally make a broken mode selection look correct.
+        let operations = [
+            (
+                Reviewer::User,
+                json!({"name":"shell", "arguments":{"command":"true"}}),
+            ),
+            (
+                Reviewer::AutoReview,
+                json!({"name":"write_file", "arguments":{"path":"config/preferences.json", "content":"{}"}}),
+            ),
+            (
+                Reviewer::AutoReview,
+                json!({"name":"edit_file", "arguments":{"path":"alias/preferences.json", "old":"user", "new":"auto_review"}}),
+            ),
+        ];
+        for (mode, operation) in operations {
             let approver = Approval {
                 mode,
                 model: &model,
                 human: &human,
-                config_directory: dir.path(),
+                config_directory: &config_directory,
             };
-            let request = json!({"directory":dir.path(), "operation":{"name":"write_file", "arguments":{"path":"preferences.json", "content":"{}"}}});
+            let request = json!({"directory":dir.path(), "operation":operation});
             assert!(matches!(
                 approver
                     .review(&request, &[], &mut transcript)
                     .await
                     .unwrap()
                     .decision,
-                Decision::Deny
+                Decision::Cancel
             ));
         }
         assert!(model.inputs.lock().unwrap().is_empty());
-        assert_eq!(human.0.load(Ordering::SeqCst), 2);
-        let history = [json!({"role":"user", "content":"x".repeat(128 * 1024)})];
-        assert!(evidence(&json!({}), &history, dir.path()).is_err());
+        assert_eq!(human.0.load(Ordering::SeqCst), 3);
     }
 
     #[tokio::test(start_paused = true)]
-    async fn timeout_does_not_authorize_execution() {
+    async fn unavailable_review_preserves_the_human_decision() {
         struct Hanging;
         impl Model for Hanging {
             async fn respond(&self, _: &[Value], _: &[Value]) -> Result<Reply> {
@@ -315,14 +341,20 @@ mod tests {
             config_directory: dir.path(),
         };
         let mut transcript = Transcript::create(&dir.path().join("log.jsonl")).unwrap();
-        assert!(matches!(
-            approver
-                .review(&json!({}), &[], &mut transcript)
-                .await
-                .unwrap()
-                .decision,
-            Decision::Deny
-        ));
-        assert_eq!(human.0.load(Ordering::SeqCst), 1);
+        // Exercise both timeout and context rejection through the approval boundary.
+        for history in [
+            vec![],
+            vec![json!({"role":"user", "content":"x".repeat(128 * 1024)})],
+        ] {
+            assert!(matches!(
+                approver
+                    .review(&json!({}), &history, &mut transcript)
+                    .await
+                    .unwrap()
+                    .decision,
+                Decision::Cancel
+            ));
+        }
+        assert_eq!(human.0.load(Ordering::SeqCst), 2);
     }
 }

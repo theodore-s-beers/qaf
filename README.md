@@ -4,36 +4,50 @@ A small terminal coding agent written in Rust for macOS and Linux.
 
 ## Run
 
-Sign in with your ChatGPT subscription, then choose a model from your account's catalog:
+Sign in with your ChatGPT subscription, choose a model from your account's catalog, and start a session:
 
 ```sh
 cargo run -- login
 cargo run -- models
-cargo run -- --model YOUR_MODEL -C /path/to/project \
-  "Fix the failing test and explain the change"
+cargo run -- --model YOUR_MODEL -C /path/to/project
 ```
 
-qaf remembers the model selected with `--model` or `OPENAI_MODEL` in `preferences.json` alongside the credentials. Selection order is `--model`, `OPENAI_MODEL`, then the saved choice. Omit the task to start an interactive session:
+Model selection order is `--model`, `OPENAI_MODEL`, then the saved preference. Explicit selections are remembered in `preferences.json`. To run a single task and exit, pass it as an argument:
 
 ```sh
-cargo run -- -C /path/to/project
+cargo run -- -C /path/to/project "Fix the failing test and explain the change"
 ```
 
-Each prompt continues the conversation. `/clear` clears conversation history without undoing file changes; `/exit` or Ctrl-D exits. Ctrl-C during a task stops it and returns to the prompt. The `--max-turns` limit applies separately to each task. Sessions stay in memory and cannot be resumed after exit; use `/clear` if the conversation exceeds the model's context limit.
+In a session, each prompt continues the conversation:
 
-At the prompt, Left/Right move the cursor, Up/Down recall earlier inputs from this session, and Ctrl-C discards the current line. Input history is kept in memory only; approval answers are not included.
+- `/clear` starts fresh without undoing file changes.
+- `/exit` or Ctrl-D exits.
+- Ctrl-C stops the current task, or discards input at the prompt.
+- Up/Down recall previous inputs.
 
-Responses use basic Markdown formatting in supported terminals, with prose wrapped to the terminal width. Code blocks retain their contents; tables remain Markdown. Redirected output and `NO_COLOR` retain the original Markdown.
+Conversation and input history last only for the current session. `--max-turns` applies separately to each task. Responses render Markdown in the terminal; redirected output and `NO_COLOR` preserve the original Markdown.
 
-Login opens your browser to authorize qaf to use your ChatGPT plan. Use `status` to view saved accounts and `logout` to sign out. To use another account or workspace, pass `--account LABEL` when logging in and running tasks.
+Each run prints the path to a JSONL transcript in the temporary directory. Transcripts contain prompts, responses, and tool activity, including file contents.
 
-Credentials are stored with owner-only permissions in `~/.config/qaf/auth.json` (or `$XDG_CONFIG_HOME/qaf/auth.json`). Keep this directory out of source control.
+Credentials and preferences live in `~/.config/qaf` (or `$XDG_CONFIG_HOME/qaf`), overridable with `--auth-dir`. Credentials have owner-only permissions; keep them out of source control. Use `status` to view accounts, `logout` to sign out, and `--account LABEL` to select an account when logging in or running tasks.
 
-The agent can read, write, and edit files and run shell commands. Tools run in an OS sandbox: reads are broadly allowed, writes are limited to the project and temporary scratch space, and network access is blocked. The qaf configuration directory (including preferences and credentials) is inaccessible to sandboxed tools; existing project `.git` and `.jj` directories are read-only. Ctrl-C interrupts the current task.
+See `cargo run -- --help` for options.
 
-For broader access, the agent must request unrestricted execution with a justification. qaf shows the operation in your terminal: type `allow` to approve that one operation, `deny` (the default) to reject it, or `cancel` to stop the current task. Approval permits execution with your user's permissions, including access to qaf's configuration directory; it bypasses the sandbox entirely. Without an interactive terminal, requests that need human approval are denied. Failed sandboxed operations are never automatically retried unrestricted.
+## Permissions
 
-To opt into automatic approval review, add `"approvals_reviewer": "auto_review"` to `preferences.json` and restart qaf:
+Tools read, write, and edit files and run shell commands. The OS sandbox permits broad reads but limits writes to the project and temporary scratch space. It blocks network access and access to qaf's configuration directory; existing project `.git` and `.jj` directories are read-only.
+
+macOS uses `/usr/bin/sandbox-exec`. Linux (x86-64 or ARM64) requires `bubblewrap` and enabled user namespaces. Check support with:
+
+```sh
+cargo run -- -C /path/to/project sandbox-check
+```
+
+qaf refuses to run tools if the sandbox cannot start.
+
+Broader access requires approval for the exact operation: `allow` once, `deny` (default), or `cancel` the task. **Approved operations bypass the sandbox entirely**, including its protection of qaf's configuration. Requests needing human approval are denied without an interactive terminal. Sandbox failures do not automatically trigger unrestricted retries.
+
+To enable auto-review, add `approvals_reviewer` to `preferences.json` and restart:
 
 ```json
 {
@@ -42,34 +56,13 @@ To opt into automatic approval review, add `"approvals_reviewer": "auto_review"`
 }
 ```
 
-The default reviewer is `"user"`. Auto-review uses the same selected model, in a separate request with its own system prompt (`REVIEW_PROMPT.md`). The reviewer model sees conversation evidence and the full proposed operation; it has no tools. Decisions and reasoning are recorded in the session transcript. Uncertain reviews, errors, and timeouts fall back to human approval. Denials return the reason to the agent without executing the operation.
+The default is `"user"`. Auto-review uses the selected model in a separate request with `REVIEW_PROMPT.md`, conversation evidence, and the full operation, but no tools. Decisions and rationales are logged. Uncertainty, errors, and timeouts fall back to human approval; denied operations do not execute.
 
-Direct writes to qaf's configuration require human approval; the reviewer policy also requires human review for indirect changes to qaf's approval settings or implementation. Model review is a judgment, not an OS security boundary; approved operations still bypass the sandbox. Preferences are read at startup, and selecting a model preserves other settings.
+Direct writes to qaf's configuration require human approval. The reviewer policy also requires human review for indirect changes to approval settings or implementation. Model review is not an OS security boundary.
 
-macOS uses the built-in `/usr/bin/sandbox-exec`. Linux (x86-64 or ARM64) requires `bubblewrap` and enabled user namespaces; distribution security settings may restrict these. Check availability with `cargo run -- -C /path/to/project sandbox-check`. qaf refuses to run tools if the sandbox cannot start.
+## Development
 
-Each run prints the path to a JSONL transcript in the system temporary directory. Transcripts include prompts, model output, and tool activity, including file contents.
-
-Run `cargo run -- --help` for options.
-
-## Structure
-
-`SYSTEM_PROMPT.md` is the source of the agent's developer prompt, embedded at compile time. Rebuild qaf after editing it. At startup, qaf fills in `{{REQUESTED_MODEL}}` with the selected model identifier; this context is preserved after `/clear`.
-
-- `src/main.rs`: CLI configuration and session loop.
-- `src/terminal.rs`: terminal input, output, and human approvals.
-- `src/auth.rs`: ChatGPT login, credentials, and token refresh.
-- `src/agent.rs`: conversation history and the model/tool loop.
-- `src/review.rs`: automatic approval review and human fallback.
-- `src/render.rs`: terminal Markdown presentation.
-- `src/model.rs`: OpenAI Responses API integration.
-- `src/tools.rs`: file and shell tools.
-- `src/permissions.rs`: access requests and approval decisions.
-- `src/preferences.rs`: saved model selection.
-- `src/sandbox.rs`: macOS and Linux sandbox launchers.
-- `src/transcript.rs`: JSONL recording.
-
-## Verify
+`SYSTEM_PROMPT.md` and `REVIEW_PROMPT.md` are embedded at compile time; rebuild after editing either. The agent prompt's `{{REQUESTED_MODEL}}` placeholder is filled with the selected model identifier.
 
 ```sh
 cargo test
@@ -77,4 +70,4 @@ cargo clippy --all-targets -- -D warnings
 cargo fmt --check
 ```
 
-Tests use scripted model replies and real file/shell tools. They require `rustc`, a POSIX shell, a working OS sandbox, and permission to bind loopback sockets, but no credentials or internet access. The key in `tests/fixtures` is generated test data, not a real credential.
+Tests use scripted model replies and real file/shell tools. They require `rustc`, a POSIX shell, a working OS sandbox, and loopback sockets, but no credentials or internet access. The key in `tests/fixtures` is generated test data.

@@ -216,10 +216,23 @@ mod tests {
                 );
             }
             drop(requests);
-            let log = std::fs::read_to_string(path).unwrap();
-            assert!(log.contains("auto_review_request"));
-            assert!(log.contains("auto_review_result"));
-            assert!(log.contains("approval_decision"));
+            let records: Vec<Value> = std::fs::read_to_string(path)
+                .unwrap()
+                .lines()
+                .map(|line| serde_json::from_str(line).unwrap())
+                .collect();
+            let decisions: Vec<_> = records
+                .iter()
+                .filter(|record| record["kind"] == "approval_decision")
+                .map(|record| record["data"].clone())
+                .collect();
+            assert_eq!(
+                decisions,
+                vec![json!({
+                    "call_id":"c1", "decision":if allowed { "allow_once" } else { "deny" },
+                    "rationale":"Review explanation"
+                })]
+            );
         }
     }
 

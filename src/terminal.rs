@@ -393,17 +393,12 @@ mod tests {
 
     #[test]
     fn approval_reason_wraps_at_words_with_continuation_indent() {
-        let mut output = String::new();
-        approval_block(
-            &mut output,
-            "Reason",
-            "Read the requested preferences file.",
-            Some(24),
-        );
-        assert_eq!(
-            output,
-            "\nReason:\n    Read the requested\n    preferences file.\n"
-        );
+        let request = serde_json::json!({
+            "operation": {"name":"read_file", "arguments":{"path":"preferences.json"}},
+            "directory":"/project", "justification":"Read the requested preferences file."
+        });
+        let prompt = approval_prompt(&request, 24).unwrap();
+        assert!(prompt.contains("\nReason:\n    Read the requested\n    preferences file.\n"));
     }
 
     #[test]
