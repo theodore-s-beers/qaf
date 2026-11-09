@@ -17,6 +17,63 @@ pub struct Approval<'a, M, H> {
     pub config_directory: &'a Path,
 }
 
+// Separate from the main model's compacted context. Keep user instructions verbatim
+// and evict older non-user evidence first. Oversized user history fails closed.
+#[derive(Default)]
+pub struct History {
+    items: Vec<Value>,
+    bytes: usize,
+    omitted: usize,
+    unavailable: bool,
+}
+
+impl History {
+    const BUDGET: usize = 96 * 1024;
+
+    pub fn push(&mut self, item: &Value) {
+        if self.unavailable || !visible(item) {
+            return;
+        }
+        let size = item.to_string().len();
+        if size > Self::BUDGET && item["role"] != "user" {
+            self.omitted += 1;
+            return;
+        }
+        self.bytes += size;
+        self.items.push(item.clone());
+        while self.bytes > Self::BUDGET {
+            let Some(index) = self.items.iter().position(|item| item["role"] != "user") else {
+                self.items.clear();
+                self.bytes = 0;
+                self.unavailable = true;
+                break;
+            };
+            self.bytes -= self.items.remove(index).to_string().len();
+            self.omitted += 1;
+        }
+    }
+
+    pub fn snapshot(&self) -> Vec<Value> {
+        let mut items = Vec::with_capacity(self.items.len() + 1);
+        if self.unavailable {
+            items.push(json!({"type":"review_context_unavailable"}));
+        } else if self.omitted > 0 {
+            items.push(json!({"type":"review_context_gap", "omitted_items":self.omitted}));
+        }
+        items.extend(self.items.iter().cloned());
+        items
+    }
+}
+
+fn visible(item: &Value) -> bool {
+    matches!(item["role"].as_str(), Some("user" | "assistant"))
+        && matches!(item["type"].as_str(), None | Some("message"))
+        || matches!(
+            item["type"].as_str(),
+            Some("function_call" | "function_call_output")
+        )
+}
+
 #[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct Verdict {
@@ -34,15 +91,16 @@ enum VerdictDecision {
 
 fn evidence(request: &Value, history: &[Value], config_directory: &Path) -> Result<Value> {
     ensure!(
-        !history.iter().any(|item| item["type"] == "compaction"),
-        "compacted context requires human review; opaque state cannot establish authorization"
+        !history.iter().any(|item| matches!(
+            item["type"].as_str(),
+            Some("compaction" | "review_context_unavailable")
+        )),
+        "readable user instructions are unavailable for review"
     );
     // Do not forward opaque reasoning items or promote conversation content to reviewer instructions.
     let conversation: Vec<_> = history
         .iter()
-        .filter(|item| {
-            item["type"] != "reasoning" && item["role"] != "developer" && item["role"] != "system"
-        })
+        .filter(|item| visible(item) || item["type"] == "review_context_gap")
         .collect();
     let evidence = json!({"conversation": conversation, "request": request, "qaf_config_directory": config_directory});
     ensure!(
@@ -205,6 +263,40 @@ mod tests {
         }
     }
 
+    #[test]
+    fn review_history_retains_user_constraints_and_marks_missing_evidence() {
+        let first = json!({"role":"user", "content":"Do not delete files"});
+        let latest = json!({"role":"user", "content":"Only read the configuration"});
+        let mut history = History::default();
+        history.push(&first);
+        history.push(&json!({"type":"reasoning", "encrypted_content":"secret"}));
+        history.push(&json!({"type":"compaction", "encrypted_content":"opaque"}));
+        history.push(&json!({"role":"developer", "content":"main agent instructions"}));
+        let old =
+            json!({"type":"function_call_output", "call_id":"old", "output":"x".repeat(60 * 1024)});
+        let recent =
+            json!({"type":"function_call_output", "call_id":"new", "output":"y".repeat(60 * 1024)});
+        history.push(&old);
+        history.push(&latest);
+        history.push(&recent);
+        history.push(&json!({"type":"function_call_output", "output":"z".repeat(128 * 1024)}));
+        let snapshot = history.snapshot();
+        assert_eq!(
+            snapshot[0],
+            json!({"type":"review_context_gap", "omitted_items":2})
+        );
+        assert_eq!(&snapshot[1..], &[first, latest, recent]);
+        assert!(history.bytes <= History::BUDGET);
+        assert!(evidence(&json!({}), &snapshot, Path::new("/config")).is_ok());
+
+        history.push(&json!({"role":"user", "content":"u".repeat(History::BUDGET)}));
+        history.push(
+            &json!({"role":"user", "content":"A later task cannot erase missing constraints"}),
+        );
+        assert!(evidence(&json!({}), &history.snapshot(), Path::new("/config")).is_err());
+        assert_eq!(history.items, [] as [Value; 0]);
+    }
+
     #[tokio::test]
     async fn reviews_are_separate_validated_and_fall_back_to_humans() {
         let dir = tempfile::tempdir().unwrap();
@@ -346,11 +438,12 @@ mod tests {
             config_directory: dir.path(),
         };
         let mut transcript = Transcript::create(&dir.path().join("log.jsonl")).unwrap();
-        // Exercise timeout, oversized evidence, and opaque compacted state.
+        // Exercise timeout, oversized requests, missing instructions, and accidental opaque input.
         for history in [
             vec![],
             vec![json!({"role":"user", "content":"x".repeat(128 * 1024)})],
             vec![json!({"type":"compaction", "encrypted_content":"opaque"})],
+            vec![json!({"type":"review_context_unavailable"})],
         ] {
             assert!(matches!(
                 approver
@@ -361,6 +454,6 @@ mod tests {
                 Decision::Cancel
             ));
         }
-        assert_eq!(human.0.load(Ordering::SeqCst), 3);
+        assert_eq!(human.0.load(Ordering::SeqCst), 4);
     }
 }

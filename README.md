@@ -61,7 +61,7 @@ To enable auto-review, add `approvals_reviewer` to `preferences.json` and restar
 
 The default is `"user"`. Auto-review uses the selected model in a separate request with `REVIEW_PROMPT.md`, conversation evidence, and the full operation, but no tools. Decisions and rationales are logged. Uncertainty, errors, and timeouts fall back to human approval; denied operations do not execute.
 
-After compaction, unrestricted operations require human approval because the reviewer cannot inspect the encrypted conversation evidence. `/clear` starts a new conversation eligible for auto-review.
+Auto-review keeps readable evidence separately from the main model’s compacted context: verbatim user messages and recent assistant/tool activity. Omitted evidence is flagged. If user instructions exceed the review budget, approval falls back to you until `/clear`.
 
 Direct writes to qaf's configuration require human approval. The reviewer policy also requires human review for indirect changes to approval settings or implementation. Model review is not an OS security boundary.
 

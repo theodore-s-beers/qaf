@@ -17,13 +17,17 @@ pub enum Event<'a> {
 pub struct Agent {
     history: Vec<Value>,
     context: crate::context::Context,
+    review_history: crate::review::History,
 }
 
 impl Agent {
     pub fn new(prompt: &str, requested_model: &str) -> Self {
         let instructions =
             include_str!("../SYSTEM_PROMPT.md").replace("{{REQUESTED_MODEL}}", requested_model);
+        let mut review_history = crate::review::History::default();
+        review_history.push(&json!({"role":"user", "content":prompt}));
         Self {
+            review_history,
             context: crate::context::Context::default(),
             history: vec![
                 json!({"role": "developer", "content": instructions}),
@@ -37,8 +41,9 @@ impl Agent {
     }
 
     pub fn add_prompt(&mut self, prompt: &str) {
-        self.history
-            .push(json!({"role": "user", "content": prompt}));
+        let item = json!({"role": "user", "content": prompt});
+        self.review_history.push(&item);
+        self.history.push(item);
     }
 
     /// Close unanswered calls before another user turn, without replaying tools.
@@ -54,6 +59,7 @@ impl Agent {
         for call_id in pending {
             let item = json!({"type": "function_call_output", "call_id": call_id,
                 "output": json!({"error": "Task stopped before a result was received. This tool may not have run, or may have partially executed. Check state before retrying."}).to_string()});
+            self.review_history.push(&item);
             self.history.push(item.clone());
             transcript.record("tool_result", &item)?;
         }
@@ -103,6 +109,9 @@ impl Agent {
             if let Some(usage) = &reply.usage {
                 transcript.record("usage", &json!(usage))?;
             }
+            for item in &reply.output {
+                self.review_history.push(item);
+            }
             if let Some(index) = boundary {
                 // Keep trusted harness instructions explicit; the encrypted item carries
                 // earlier conversation state. Preserve all items after that boundary.
@@ -135,7 +144,7 @@ impl Agent {
                             transcript.record("approval_request", &description)?;
                             emit(Event::Approval);
                             let review = approver
-                                .review(&description, &self.history, transcript)
+                                .review(&description, &self.review_history.snapshot(), transcript)
                                 .await?;
                             transcript.record(
                                 "approval_decision",
@@ -163,6 +172,7 @@ impl Agent {
                 };
                 let item = json!({"type": "function_call_output", "call_id": call.call_id, "output": output.to_string()});
                 transcript.record("tool_result", &item)?;
+                self.review_history.push(&item);
                 self.history.push(item);
             }
         }
@@ -311,11 +321,14 @@ mod tests {
             let mut transcript = Transcript::create(&path).unwrap();
             let verdict = if allowed { "allow" } else { "deny" };
             let model = Scripted::new(vec![
-                vec![call(
-                    "c1",
-                    "shell",
-                    &json!({"command":"printf reviewed > result.txt", "access":"unrestricted", "justification":"Requested file"}),
-                )],
+                vec![
+                    json!({"type":"compaction", "encrypted_content":"opaque"}),
+                    call(
+                        "c1",
+                        "shell",
+                        &json!({"command":"printf reviewed > result.txt", "access":"unrestricted", "justification":"Requested file"}),
+                    ),
+                ],
                 vec![
                     json!({"type":"message", "content":[{"type":"output_text", "text":json!({"decision":verdict, "rationale":"Review explanation"}).to_string()}]}),
                 ],
@@ -333,6 +346,14 @@ mod tests {
                 .unwrap();
             assert_eq!(dir.path().join("result.txt").exists(), allowed);
             let requests = model.requests.lock().unwrap();
+            let evidence: Value =
+                serde_json::from_str(requests[1][1]["content"].as_str().unwrap()).unwrap();
+            assert_eq!(
+                evidence["conversation"][0],
+                json!({"role":"user", "content":"Create result.txt"})
+            );
+            assert!(!evidence.to_string().contains("encrypted_content"));
+            assert!(requests[2].iter().any(|item| item["type"] == "compaction"));
             let tool_result = requests[2]
                 .iter()
                 .find(|item| item["type"] == "function_call_output")
