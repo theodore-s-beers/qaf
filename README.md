@@ -21,11 +21,14 @@ cargo run -- -C /path/to/project "Fix the failing test and explain the change"
 In a session, each prompt continues the conversation:
 
 - `/clear` starts fresh without undoing file changes.
+- `/context` shows approximate context usage.
 - `/exit` or Ctrl-D exits.
 - Ctrl-C stops the current task, or discards input at the prompt.
 - Up/Down recall previous inputs.
 
 Conversation and input history last only for the current session. `--max-turns` applies separately to each task. Responses render Markdown in the terminal; redirected output and `NO_COLOR` preserve the original Markdown.
+
+qaf requests server-side compaction at 230,000 tokens, leaving headroom within a 258,000-token working budget. This is not a hard input limit. Compaction replaces older conversation with encrypted state; the full transcript remains intact. Usage is approximate between responses and immediately after compaction.
 
 Each run prints the path to a JSONL transcript in the temporary directory. Transcripts contain prompts, responses, and tool activity, including file contents.
 
@@ -57,6 +60,8 @@ To enable auto-review, add `approvals_reviewer` to `preferences.json` and restar
 ```
 
 The default is `"user"`. Auto-review uses the selected model in a separate request with `REVIEW_PROMPT.md`, conversation evidence, and the full operation, but no tools. Decisions and rationales are logged. Uncertainty, errors, and timeouts fall back to human approval; denied operations do not execute.
+
+After compaction, unrestricted operations require human approval because the reviewer cannot inspect the encrypted conversation evidence. `/clear` starts a new conversation eligible for auto-review.
 
 Direct writes to qaf's configuration require human approval. The reviewer policy also requires human review for indirect changes to approval settings or implementation. Model review is not an OS security boundary.
 

@@ -77,6 +77,7 @@ fn request_body(model: &str, history: &[Value], tools: &[Value]) -> Value {
         "tools": if tools.is_empty() { vec![] } else { vec![json!({"type": "namespace", "name": "qaf", "description": "Local coding tools", "tools": tools})] },
         "store": false, "stream": true, "include": ["reasoning.encrypted_content"],
         "parallel_tool_calls": false,
+        "context_management": [{"type":"compaction", "compact_threshold":crate::context::COMPACT_AT}],
     })
 }
 
@@ -199,6 +200,14 @@ impl Events {
 pub struct Reply {
     // Preserve every item, including reasoning and provider metadata.
     pub output: Vec<Value>,
+    #[serde(default)]
+    pub usage: Option<Usage>,
+}
+
+#[derive(Debug, Deserialize, serde::Serialize)]
+pub struct Usage {
+    pub input_tokens: u64,
+    pub output_tokens: u64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -256,6 +265,10 @@ mod tests {
         );
         assert_eq!(body["stream"], true);
         assert_eq!(body["store"], false);
+        assert_eq!(
+            body["context_management"][0]["compact_threshold"],
+            crate::context::COMPACT_AT
+        );
         assert_eq!(body["tools"][0]["type"], "namespace");
         assert_eq!(body["tools"][0]["name"], "qaf");
         assert_eq!(body["tools"][0]["tools"][0]["name"], "read_file");
@@ -269,8 +282,7 @@ mod tests {
             reasoning.clone(),
             json!({"type":"function_call","namespace":"qaf","name":"read_file","arguments":"{\"path\":\"café\"}","call_id":"c1"}),
         ];
-        let terminal =
-            json!({"type":"response.completed","response":{"status":"completed","output":output}});
+        let terminal = json!({"type":"response.completed","response":{"status":"completed","output":output,"usage":{"input_tokens":123,"output_tokens":45}}});
         let wire = format!(
             ": keepalive\r\nevent: response.completed\r\ndata: {terminal}\r\n\r\ndata: [DONE]\r\n\r\n"
         );
@@ -285,6 +297,8 @@ mod tests {
                 }
             }
             assert_eq!(replies.len(), 1);
+            assert_eq!(replies[0].usage.as_ref().unwrap().input_tokens, 123);
+            assert_eq!(replies[0].usage.as_ref().unwrap().output_tokens, 45);
             assert_eq!(replies[0].output[0], reasoning);
             assert_eq!(replies[0].calls().unwrap()[0].name, "read_file");
         }
@@ -317,6 +331,7 @@ mod tests {
     #[test]
     fn tool_calls_reject_foreign_namespaces() {
         let reply = Reply {
+            usage: None,
             output: vec![
                 json!({"type":"function_call","namespace":"foreign","name":"shell","arguments":"{}","call_id":"x"}),
             ],

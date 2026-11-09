@@ -10,11 +10,13 @@ use serde_json::{Value, json};
 pub enum Event<'a> {
     Text(&'a str),
     Approval,
+    Compacted,
     Tool(&'a crate::tools::Tool),
 }
 
 pub struct Agent {
     history: Vec<Value>,
+    context: crate::context::Context,
 }
 
 impl Agent {
@@ -22,11 +24,16 @@ impl Agent {
         let instructions =
             include_str!("../SYSTEM_PROMPT.md").replace("{{REQUESTED_MODEL}}", requested_model);
         Self {
+            context: crate::context::Context::default(),
             history: vec![
                 json!({"role": "developer", "content": instructions}),
                 json!({"role": "user", "content": prompt}),
             ],
         }
+    }
+
+    pub fn context_tokens(&self) -> u64 {
+        self.context.estimate(&self.history, &Tools::definitions())
     }
 
     pub fn add_prompt(&mut self, prompt: &str) {
@@ -71,7 +78,43 @@ impl Agent {
             transcript.record("model", &json!(reply.output))?;
             let calls = reply.calls()?;
             let text = reply.text();
-            self.history.extend(reply.output);
+            let boundary = reply
+                .output
+                .iter()
+                .rposition(|item| item["type"] == "compaction");
+            if let Some(index) = boundary {
+                ensure!(
+                    reply.output[index]["encrypted_content"]
+                        .as_str()
+                        .is_some_and(|s| !s.is_empty()),
+                    "compaction returned empty encrypted context; original history retained"
+                );
+                ensure!(
+                    !reply.output[..index]
+                        .iter()
+                        .any(|item| item["type"] == "function_call"),
+                    "compaction interrupted a tool batch; original history retained"
+                );
+                transcript.record(
+                    "compaction",
+                    &json!({"discarded_items":self.history.len() - 1 + index}),
+                )?;
+            }
+            if let Some(usage) = &reply.usage {
+                transcript.record("usage", &json!(usage))?;
+            }
+            if let Some(index) = boundary {
+                // Keep trusted harness instructions explicit; the encrypted item carries
+                // earlier conversation state. Preserve all items after that boundary.
+                self.history.truncate(1);
+                self.history.extend(reply.output.into_iter().skip(index));
+                self.context.compacted();
+                emit(Event::Compacted);
+            } else {
+                self.history.extend(reply.output);
+                self.context
+                    .record(reply.usage.as_ref(), self.history.len());
+            }
             if !text.is_empty() {
                 emit(Event::Text(&text));
             }
@@ -141,7 +184,15 @@ mod tests {
     impl Scripted {
         fn new(outputs: Vec<Vec<Value>>) -> Self {
             Self {
-                replies: Mutex::new(outputs.into_iter().map(|output| Reply { output }).collect()),
+                replies: Mutex::new(
+                    outputs
+                        .into_iter()
+                        .map(|output| Reply {
+                            output,
+                            usage: None,
+                        })
+                        .collect(),
+                ),
                 requests: Mutex::new(Vec::new()),
             }
         }
@@ -170,6 +221,85 @@ mod tests {
 
     fn answer() -> Value {
         json!({"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "Fixed and verified."}]})
+    }
+
+    #[tokio::test]
+    async fn inline_compaction_preserves_instructions_and_new_tool_results() {
+        let dir = tempfile::tempdir().unwrap();
+        let tools = Tools::for_test(dir.path(), Duration::from_secs(1)).unwrap();
+        let path = dir.path().join("log");
+        let mut transcript = Transcript::create(&path).unwrap();
+        let compact = json!({"type":"compaction", "encrypted_content":"opaque"});
+        let new_call = call("new", "read_file", &json!({"path":"missing"}));
+        let model = Scripted::new(vec![
+            vec![compact.clone(), new_call.clone()],
+            vec![answer()],
+        ]);
+        model.replies.lock().unwrap().front_mut().unwrap().usage = Some(crate::model::Usage {
+            input_tokens: 240_000,
+            output_tokens: 100,
+        });
+        let mut agent = Agent::new("Original task", "test-model");
+        let instructions = agent.history[0].clone();
+        let mut compactions = 0;
+        agent
+            .run(
+                &model,
+                &tools,
+                &mut transcript,
+                2,
+                &crate::permissions::Deny,
+                |event| {
+                    if matches!(event, Event::Compacted) {
+                        compactions += 1;
+                    }
+                },
+            )
+            .await
+            .unwrap();
+        let requests = model.requests.lock().unwrap();
+        assert_eq!(&requests[1][..3], &[instructions, compact, new_call]);
+        assert_eq!(requests[1][3]["type"], "function_call_output");
+        assert_eq!(requests[1][3]["call_id"], "new");
+        assert_eq!(compactions, 1);
+        assert!(agent.context_tokens() < crate::context::COMPACT_AT);
+        assert!(
+            std::fs::read_to_string(path)
+                .unwrap()
+                .contains("Original task")
+        );
+    }
+
+    #[tokio::test]
+    async fn malformed_compaction_preserves_history() {
+        let dir = tempfile::tempdir().unwrap();
+        let tools = Tools::for_test(dir.path(), Duration::from_secs(1)).unwrap();
+        let mut transcript = Transcript::create(&dir.path().join("log")).unwrap();
+        for output in [
+            vec![json!({"type":"compaction"}), answer()],
+            vec![
+                call("pending", "read_file", &json!({"path":"missing"})),
+                json!({"type":"compaction","encrypted_content":"opaque"}),
+                answer(),
+            ],
+        ] {
+            let mut agent = Agent::new("Keep this task", "test-model");
+            let original = agent.history.clone();
+            assert!(
+                agent
+                    .run(
+                        &Scripted::new(vec![output]),
+                        &tools,
+                        &mut transcript,
+                        1,
+                        &crate::permissions::Deny,
+                        |_| {}
+                    )
+                    .await
+                    .is_err()
+            );
+            assert_eq!(agent.history, original);
+        }
     }
 
     #[tokio::test]

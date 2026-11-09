@@ -1,5 +1,6 @@
 mod agent;
 mod auth;
+mod context;
 mod model;
 mod permissions;
 mod preferences;
@@ -216,7 +217,7 @@ async fn interactive(
     approver: &impl permissions::Approver,
 ) -> Result<()> {
     terminal::status(format_args!(
-        "Enter a task. /clear starts fresh; /exit or Ctrl-D exits. Ctrl-C stops the current task."
+        "Enter a task. /context shows usage; /clear starts fresh; /exit or Ctrl-D exits. Ctrl-C stops the current task."
     ));
     let mut agent: Option<agent::Agent> = None;
     loop {
@@ -230,6 +231,15 @@ async fn interactive(
         match prompt {
             "" => continue,
             "/exit" => return Ok(()),
+            "/context" => {
+                terminal::status(format_args!(
+                    "Context: approximately {} / {} tokens; auto-compaction at {}.",
+                    agent.as_ref().map_or(0, agent::Agent::context_tokens),
+                    context::WINDOW,
+                    context::COMPACT_AT
+                ));
+                continue;
+            }
             "/clear" => {
                 agent = None;
                 transcript.record("clear", &json!({}))?;
@@ -237,7 +247,7 @@ async fn interactive(
                 continue;
             }
             _ if prompt.starts_with('/') && !prompt.contains(char::is_whitespace) => {
-                eprintln!("Unknown command. Use /clear or /exit.");
+                eprintln!("Unknown command. Use /context, /clear, or /exit.");
                 continue;
             }
             _ => {}
@@ -272,6 +282,10 @@ async fn task(
                     showing_tools = false;
                 }
                 agent::Event::Approval => showing_tools = false,
+                agent::Event::Compacted => {
+                    terminal::status(format_args!("\nConversation compacted."));
+                    showing_tools = false;
+                }
                 agent::Event::Tool(tool) => {
                     if !showing_tools {
                         eprintln!();
@@ -318,6 +332,7 @@ mod tests {
                     Err(anyhow::anyhow!("test model failure"))
                 } else {
                     Ok(model::Reply {
+                        usage: None,
                         output: vec![json!({"type":"message", "role":"assistant",
                         "content":[{"type":"output_text","text":"Done"}]})],
                     })
@@ -338,8 +353,10 @@ mod tests {
         let mut transcript = transcript::Transcript::create(&path).unwrap();
         let model = Model(Mutex::new(Vec::new()));
         let mut terminal = Prompts(VecDeque::from([
+            terminal::Input::Line("/context".into()),
             terminal::Input::Interrupted,
             terminal::Input::Line("first".into()),
+            terminal::Input::Line("/context".into()),
             terminal::Input::Interrupted,
             terminal::Input::Line("followup".into()),
             terminal::Input::Line("/clear".into()),

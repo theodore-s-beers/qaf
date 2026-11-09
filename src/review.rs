@@ -33,6 +33,10 @@ enum VerdictDecision {
 }
 
 fn evidence(request: &Value, history: &[Value], config_directory: &Path) -> Result<Value> {
+    ensure!(
+        !history.iter().any(|item| item["type"] == "compaction"),
+        "compacted context requires human review; opaque state cannot establish authorization"
+    );
     // Do not forward opaque reasoning items or promote conversation content to reviewer instructions.
     let conversation: Vec<_> = history
         .iter()
@@ -186,6 +190,7 @@ mod tests {
             assert_eq!(tools, &[] as &[Value]);
             self.inputs.lock().unwrap().push(input.to_vec());
             std::future::ready(Ok(Reply {
+                usage: None,
                 output: vec![
                     json!({"type":"message", "content":[{"type":"output_text", "text": self.response}]}),
                 ],
@@ -341,10 +346,11 @@ mod tests {
             config_directory: dir.path(),
         };
         let mut transcript = Transcript::create(&dir.path().join("log.jsonl")).unwrap();
-        // Exercise both timeout and context rejection through the approval boundary.
+        // Exercise timeout, oversized evidence, and opaque compacted state.
         for history in [
             vec![],
             vec![json!({"role":"user", "content":"x".repeat(128 * 1024)})],
+            vec![json!({"type":"compaction", "encrypted_content":"opaque"})],
         ] {
             assert!(matches!(
                 approver
@@ -355,6 +361,6 @@ mod tests {
                 Decision::Cancel
             ));
         }
-        assert_eq!(human.0.load(Ordering::SeqCst), 2);
+        assert_eq!(human.0.load(Ordering::SeqCst), 3);
     }
 }
