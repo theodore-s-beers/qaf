@@ -103,10 +103,16 @@ impl Tools {
 
     // The caller must obtain human approval before passing Unrestricted.
     pub async fn run(&self, request: &Request) -> Value {
-        match self.execute_inner(request).await {
+        let mut output = match self.execute_inner(request).await {
             Ok(result) => result,
             Err(error) => json!({"error": format!("{error:#}")}),
-        }
+        };
+        annotate_failure(
+            &mut output,
+            self.sandbox.is_some() && request.access == Access::Sandbox,
+            self.timeout,
+        );
+        output
     }
 
     async fn execute_inner(&self, request: &Request) -> Result<Value> {
@@ -164,6 +170,24 @@ impl Tools {
             .current_dir(&self.directory)
             .stdin(Stdio::null());
         run_command(command, self.timeout, OUTPUT_LIMIT).await
+    }
+}
+
+fn annotate_failure(output: &mut Value, sandboxed: bool, timeout: Duration) {
+    let failed = output.get("error").is_some()
+        || output["timed_out"] == true
+        || output.get("exit_code").is_some_and(|code| code != 0);
+    if !failed {
+        return;
+    }
+    output["execution_context"] = json!({
+        "access": if sandboxed { "sandbox" } else { "unrestricted" },
+        "timeout_seconds": timeout.as_secs_f64(),
+    });
+    if sandboxed {
+        output["diagnostic_hint"] = json!(
+            "This operation ran sandboxed: no network access, writes limited to the project and private scratch, qaf configuration hidden, repository metadata read-only. These restrictions may explain the failure or timeout, but this is not a confirmed sandbox denial. Inspect stdout/stderr and the operation before requesting unrestricted access with a justification. Do not repeat a potentially partially completed operation without checking its effects."
+        );
     }
 }
 
@@ -306,6 +330,34 @@ impl Drop for ProcessGroup {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn failure_context_distinguishes_restrictions_from_command_errors() {
+        for failure in [
+            json!({"exit_code": 7, "stderr": "problem"}),
+            json!({"exit_code": null, "timed_out": true, "stdout": "partial"}),
+            json!({"error": "permission denied"}),
+        ] {
+            for sandboxed in [false, true] {
+                let mut output = failure.clone();
+                annotate_failure(&mut output, sandboxed, Duration::from_secs(120));
+                for (key, value) in failure.as_object().unwrap() {
+                    assert_eq!(&output[key], value);
+                }
+                assert_eq!(output["execution_context"]["timeout_seconds"], 120.0);
+                assert_eq!(
+                    output["execution_context"]["access"],
+                    if sandboxed { "sandbox" } else { "unrestricted" }
+                );
+                assert_eq!(output.get("diagnostic_hint").is_some(), sandboxed);
+            }
+        }
+        for mut success in [json!({"exit_code": 0}), json!({"content": "file"})] {
+            let original = success.clone();
+            annotate_failure(&mut success, true, Duration::from_secs(120));
+            assert_eq!(success, original);
+        }
+    }
 
     #[tokio::test]
     async fn edit_rejects_ambiguous_matches_and_bad_arguments() {
