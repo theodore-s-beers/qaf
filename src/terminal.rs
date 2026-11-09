@@ -199,7 +199,7 @@ impl Terminal {
     }
 }
 
-fn approval_prompt(request: &serde_json::Value) -> Result<String> {
+fn approval_prompt(request: &serde_json::Value, width: usize) -> Result<String> {
     use crate::tools::Tool;
     use std::fmt::Write as _;
 
@@ -220,26 +220,26 @@ fn approval_prompt(request: &serde_json::Value) -> Result<String> {
                 "Write {} (create or overwrite)",
                 serde_json::to_string(&path)?
             )?;
-            approval_block(&mut prompt, "Full contents", &content);
+            approval_block(&mut prompt, "Full contents", &content, None);
         }
         Tool::EditFile { path, old, new } => {
             writeln!(prompt, "Edit {}", serde_json::to_string(&path)?)?;
-            approval_block(&mut prompt, "Replace exactly one occurrence", &old);
-            approval_block(&mut prompt, "With", &new);
+            approval_block(&mut prompt, "Replace exactly one occurrence", &old, None);
+            approval_block(&mut prompt, "With", &new, None);
         }
-        Tool::Shell { command } => approval_block(&mut prompt, "Run shell command", &command),
+        Tool::Shell { command } => approval_block(&mut prompt, "Run shell command", &command, None),
     }
     writeln!(
         prompt,
         "\nWorking directory: {}",
         serde_json::to_string(directory)?
     )?;
-    approval_block(&mut prompt, "Reason", reason);
+    approval_block(&mut prompt, "Reason", reason, Some(width));
     prompt.push_str("\nThis operation will run WITHOUT the sandbox, with your user permissions.\n\nType allow (once), deny [default], or cancel: ");
     Ok(prompt)
 }
 
-fn approval_block(output: &mut String, label: &str, text: &str) {
+fn approval_block(output: &mut String, label: &str, text: &str, width: Option<usize>) {
     if !output.ends_with("\n\n") {
         output.push('\n');
     }
@@ -249,15 +249,27 @@ fn approval_block(output: &mut String, label: &str, text: &str) {
         output.push_str("    (empty)\n");
         return;
     }
-    // Keep every line, indent untrusted text, and escape terminal controls.
+    // Escape terminal controls before wrapping prose; code stays verbatim.
     for line in text.split('\n') {
-        output.push_str("    ");
-        for character in line.chars() {
-            if character.is_control() {
-                output.push_str(&character.escape_debug().to_string());
-            } else {
-                output.push(character);
-            }
+        let safe: String = line
+            .chars()
+            .map(|character| {
+                if character.is_control() {
+                    character.escape_debug().to_string()
+                } else {
+                    character.to_string()
+                }
+            })
+            .collect();
+        if let Some(width) = width {
+            let options = textwrap::Options::new(width.max(5))
+                .initial_indent("    ")
+                .subsequent_indent("    ")
+                .break_words(false);
+            output.push_str(&textwrap::fill(&safe, options));
+        } else {
+            output.push_str("    ");
+            output.push_str(&safe);
         }
         output.push('\n');
     }
@@ -272,7 +284,9 @@ impl crate::permissions::Approver for Human {
             eprintln!("Broader access denied: no interactive terminal is available.");
             return Ok(Decision::Deny);
         };
-        terminal.write(&approval_prompt(request)?).await?;
+        let width = terminal_size::terminal_size_of(&terminal.file)
+            .map_or(80, |(width, _)| usize::from(width.0));
+        terminal.write(&approval_prompt(request, width)?).await?;
         let answer = terminal.read_line(32).await?.unwrap_or_default();
         Ok(match answer.trim() {
             "allow" => Decision::AllowOnce,
@@ -324,7 +338,7 @@ mod tests {
                 ],
             ),
         ] {
-            let prompt = approval_prompt(&json!({"operation": operation, "directory": "/project", "justification": "Requested\rby user"})).unwrap();
+            let prompt = approval_prompt(&json!({"operation": operation, "directory": "/project", "justification": "Requested\rby user"}), 80).unwrap();
             for text in expected {
                 assert!(prompt.contains(&text), "missing {text:?} in {prompt:?}");
             }
@@ -334,6 +348,21 @@ mod tests {
             assert!(prompt.ends_with("Type allow (once), deny [default], or cancel: "));
             assert!(!prompt.contains('\x1b'));
         }
+    }
+
+    #[test]
+    fn approval_reason_wraps_at_words_with_continuation_indent() {
+        let mut output = String::new();
+        approval_block(
+            &mut output,
+            "Reason",
+            "Read the requested preferences file.",
+            Some(24),
+        );
+        assert_eq!(
+            output,
+            "\nReason:\n    Read the requested\n    preferences file.\n"
+        );
     }
 
     #[test]

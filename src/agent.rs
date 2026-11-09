@@ -9,6 +9,7 @@ use serde_json::{Value, json};
 
 pub enum Event<'a> {
     Text(&'a str),
+    Approval,
     Tool(&'a crate::tools::Tool),
 }
 
@@ -89,6 +90,7 @@ impl Agent {
                             let mut description = request.description(tools.directory());
                             description["call_id"] = json!(call.call_id);
                             transcript.record("approval_request", &description)?;
+                            emit(Event::Approval);
                             let decision = approver.approve(&description).await?;
                             transcript.record(
                                 "approval_decision",

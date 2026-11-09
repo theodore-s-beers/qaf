@@ -236,6 +236,7 @@ async fn task(
                     println!("\n{}", render::response(text));
                     showing_tools = false;
                 }
+                agent::Event::Approval => showing_tools = false,
                 agent::Event::Tool(tool) => {
                     if !showing_tools {
                         eprintln!();
