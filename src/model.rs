@@ -155,10 +155,9 @@ async fn local_date() -> Result<String> {
 }
 
 fn request_body(model: &str, history: &[Value], tools: &[Value], date: &str) -> Value {
-    let mut input = vec![
-        json!({"role":"developer", "content":format!("Current local date: {date} (in the user's system timezone). Use this date when interpreting today; it takes precedence over a fallback current date.")}),
-    ];
-    input.extend_from_slice(history);
+    // Keep the conversation prefix stable when the local date changes.
+    let mut input = history.to_vec();
+    input.push(json!({"role":"developer", "content":format!("Current local date: {date} (in the user's system timezone). Use this date when interpreting today; it takes precedence over a fallback current date.")}));
     json!({
         "model": model, "input": input,
         "tools": if tools.is_empty() { vec![] } else { vec![json!({"type": "namespace", "name": "qaf", "description": "Local coding tools", "tools": tools}), json!({"type":"web_search"})] },
@@ -546,14 +545,14 @@ mod tests {
             &[json!({"type":"function","name":"read_file"})],
             "2026-11-08",
         );
-        assert_eq!(body["input"][0]["role"], "developer");
+        assert_eq!(body["input"][1]["role"], "developer");
         assert!(
-            body["input"][0]["content"]
+            body["input"][1]["content"]
                 .as_str()
                 .unwrap()
                 .contains("Current local date: 2026-11-08")
         );
-        assert_eq!(body["input"][1], json!({"role":"user","content":"hello"}));
+        assert_eq!(body["input"][0], json!({"role":"user","content":"hello"}));
         assert_eq!(body["stream"], true);
         assert_eq!(body["store"], false);
         assert_eq!(
