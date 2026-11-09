@@ -28,6 +28,27 @@ pub fn reviewer(path: &Path) -> Result<Reviewer> {
     }
 }
 
+pub fn reviewer_model(path: &Path) -> Result<Option<String>> {
+    #[derive(Deserialize)]
+    struct Selection {
+        reviewer_model: Option<String>,
+    }
+    let bytes = match std::fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+    let selection: Selection =
+        serde_json::from_slice(&bytes).context("read reviewer_model preference")?;
+    if let Some(name) = &selection.reviewer_model {
+        ensure!(
+            !name.trim().is_empty() && !name.contains(char::is_whitespace),
+            "reviewer_model must be a nonempty model identifier"
+        );
+    }
+    Ok(selection.reviewer_model)
+}
+
 #[derive(Deserialize, Serialize)]
 struct Preferences {
     model: String,
@@ -87,6 +108,7 @@ mod tests {
         let path = root.path().join("qaf/preferences.json");
         assert!(select_model(&path, None).is_err());
         assert_eq!(reviewer(&path).unwrap(), Reviewer::User);
+        assert_eq!(reviewer_model(&path).unwrap(), None);
         assert_eq!(select_model(&path, Some("first")).unwrap(), "first");
         remember_model(&path, "first").unwrap();
         assert_eq!(reviewer(&path).unwrap(), Reviewer::User);
@@ -99,14 +121,32 @@ mod tests {
         assert!(remember_model(&path, "second").is_err());
         std::fs::write(
             &path,
-            r#"{"model":"first","approvals_reviewer":"auto_review"}"#,
+            r#"{"model":"first","approvals_reviewer":"auto_review","reviewer_model":"review-model"}"#,
         )
         .unwrap();
         remember_model(&path, "second").unwrap();
         assert_eq!(reviewer(&path).unwrap(), Reviewer::AutoReview);
+        assert_eq!(
+            reviewer_model(&path).unwrap().as_deref(),
+            Some("review-model")
+        );
         assert_eq!(select_model(&path, None).unwrap(), "second");
         assert!(select_model(&path, Some("")).is_err());
         std::fs::write(&path, r#"{"model":"second","approvals_reviewer":"typo"}"#).unwrap();
         assert!(reviewer(&path).is_err());
+        for value in [
+            serde_json::json!(""),
+            serde_json::json!("two words"),
+            serde_json::json!(42),
+        ] {
+            std::fs::write(
+                &path,
+                serde_json::json!({"reviewer_model":value}).to_string(),
+            )
+            .unwrap();
+            assert!(reviewer_model(&path).is_err());
+        }
+        std::fs::write(&path, r#"{"reviewer_model":null}"#).unwrap();
+        assert_eq!(reviewer_model(&path).unwrap(), None);
     }
 }

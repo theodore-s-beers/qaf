@@ -300,9 +300,16 @@ mod tests {
             "first".into(),
         )
         .unwrap();
+        let pinned = Client::new(
+            crate::auth::Store::new(Some(dir.path().to_owned())).unwrap(),
+            "default".into(),
+            "review-model".into(),
+        )
+        .unwrap();
         let reviewer_client = &client;
         client.remember_selection("second").unwrap();
         assert_eq!(*reviewer_client.model.read().unwrap(), "second");
+        assert_eq!(*pinned.model.read().unwrap(), "review-model");
         assert_eq!(
             crate::preferences::select_model(&path, None).unwrap(),
             "second"

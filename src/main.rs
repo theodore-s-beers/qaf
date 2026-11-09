@@ -111,10 +111,15 @@ async fn run() -> Result<()> {
     .await?;
     let config_directory = store.directory().to_owned();
     let reviewer = preferences::reviewer(&preferences_path)?;
+    let reviewer_name = preferences::reviewer_model(&preferences_path)?;
+    let reviewer_model = reviewer_name
+        .as_ref()
+        .map(|name| model::Client::new(store.clone(), args.account.clone(), name.clone()))
+        .transpose()?;
     let model = model::Client::new(store, args.account.clone(), model_name.clone())?;
     let approver = review::Approval {
         mode: reviewer,
-        model: &model,
+        model: reviewer_model.as_ref().unwrap_or(&model),
         human: &terminal::Human,
         config_directory: &config_directory,
     };
@@ -128,7 +133,7 @@ async fn run() -> Result<()> {
     let mut transcript = transcript::Transcript::create(&path)?;
     transcript.record(
         "start",
-        &json!({"model": model_name, "account": args.account, "directory": tools.directory(), "max_turns": args.max_turns, "interactive": terminal.is_some(), "approvals_reviewer": reviewer}),
+        &json!({"model": model_name, "account": args.account, "directory": tools.directory(), "max_turns": args.max_turns, "interactive": terminal.is_some(), "approvals_reviewer": reviewer, "reviewer_model":reviewer_name}),
     )?;
     if args.model.is_some() {
         preferences::remember_model(&preferences_path, &model_name)?;
@@ -141,6 +146,12 @@ async fn run() -> Result<()> {
             preferences::Reviewer::AutoReview => "auto-review",
         }
     ));
+    if reviewer == preferences::Reviewer::AutoReview {
+        terminal::status(format_args!(
+            "Reviewer model: {}",
+            reviewer_name.as_deref().unwrap_or("follows session model")
+        ));
+    }
     terminal::status(format_args!("Transcript: {}", path.display()));
     if let Some(prompt) = args.prompt {
         let mut agent = agent::Agent::new(&prompt, &model_name);
