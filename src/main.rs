@@ -1,6 +1,7 @@
 mod agent;
 mod auth;
 mod context;
+mod live;
 mod model;
 mod permissions;
 mod preferences;
@@ -153,6 +154,7 @@ async fn run() -> Result<()> {
         .await?
         .map_err(anyhow::Error::msg)?;
     } else if let Some(mut terminal) = terminal {
+        let _session = live::Session::start()?;
         interactive(
             &mut terminal,
             &model,
@@ -252,54 +254,23 @@ async fn interactive(
     approver: &impl permissions::Approver,
 ) -> Result<()> {
     terminal::status(format_args!(
-        "Enter a task. /model switches models; /context shows usage; /clear starts fresh; /exit or Ctrl-D exits. Ctrl-C stops the current task."
+        "/model switches models; /context shows usage; /clear starts fresh; /exit or Ctrl-D exits; Ctrl-C stops the current task."
     ));
     let mut model_name = model_name.to_owned();
     let mut agent: Option<agent::Agent> = None;
     loop {
-        eprintln!();
+        terminal::status(format_args!(""));
         let line = match terminal.read_prompt().await? {
             terminal::Input::Line(line) => line,
             terminal::Input::Interrupted => continue,
             terminal::Input::Eof => return Ok(()),
         };
+        if live::active() {
+            terminal::output(&terminal::user_message("qaf>", &line))?;
+        }
         let prompt = line.trim();
         if prompt.split_whitespace().next() == Some("/model") {
-            let words: Vec<_> = prompt.split_whitespace().collect();
-            match words.as_slice() {
-                [_] => terminal::status(format_args!(
-                    "Model: {model_name}. Use /model NAME to switch; run qaf models for choices."
-                )),
-                [_, name] if *name == model_name => {
-                    terminal::status(format_args!("Model: {model_name}"));
-                }
-                [_, name] => {
-                    let result = tokio::select! {
-                        result = model.select_model(name) => result,
-                        signal = tokio::signal::ctrl_c() => {
-                            signal.context("listen for Ctrl-C")?;
-                            Err(anyhow::anyhow!("interrupted"))
-                        }
-                    };
-                    match result {
-                        Ok(()) => {
-                            transcript
-                                .record("model_changed", &json!({"from":model_name,"to":name}))?;
-                            model_name = (*name).to_owned();
-                            if let Some(agent) = agent.as_mut() {
-                                agent.select_model(name);
-                            }
-                            terminal::status(format_args!("Model: {model_name}"));
-                        }
-                        Err(error) => {
-                            eprintln!(
-                                "Could not switch model; still using {model_name}: {error:#}"
-                            );
-                        }
-                    }
-                }
-                _ => eprintln!("Usage: /model [NAME]"),
-            }
+            switch_model(prompt, &mut model_name, &mut agent, model, transcript).await?;
             continue;
         }
         match prompt {
@@ -317,23 +288,33 @@ async fn interactive(
             "/clear" => {
                 agent = None;
                 transcript.record("clear", &json!({}))?;
-                eprintln!("\nConversation cleared. Files and scratch space are unchanged.");
+                terminal::status(format_args!(
+                    "\nConversation cleared. Files and scratch space are unchanged."
+                ));
                 continue;
             }
             _ if prompt.starts_with('/') && !prompt.contains(char::is_whitespace) => {
-                eprintln!("Unknown command. Use /model, /context, /clear, or /exit.");
+                terminal::status(format_args!(
+                    "Unknown command. Use /model, /context, /clear, or /exit."
+                ));
                 continue;
             }
             _ => {}
         }
         if let Some(agent) = agent.as_mut() {
+            agent.accept_followups(transcript)?;
             agent.add_prompt(prompt);
         }
         let agent = agent.get_or_insert_with(|| agent::Agent::new(prompt, &model_name));
         if let Err(error) = task(agent, model, tools, transcript, max_turns, approver).await? {
-            eprintln!(
+            terminal::status(format_args!(
                 "Task stopped: {error}\nYou can continue with another prompt, or /clear to start fresh."
-            );
+            ));
+        }
+        if !agent.followups().is_empty() {
+            terminal::status(format_args!(
+                "Undelivered follow-ups are retained for your next prompt; /clear discards them."
+            ));
         }
         let tokens = agent.context_tokens();
         let percent = (u128::from(tokens) * 100 + u128::from(context::WINDOW) / 2)
@@ -346,7 +327,52 @@ async fn interactive(
     }
 }
 
-// The outer Result is for transcript failures: don't keep working without a log.
+async fn switch_model(
+    prompt: &str,
+    model_name: &mut String,
+    agent: &mut Option<agent::Agent>,
+    model: &impl model::Model,
+    transcript: &mut transcript::Transcript,
+) -> Result<()> {
+    let words: Vec<_> = prompt.split_whitespace().collect();
+    match words.as_slice() {
+        [_] => terminal::status(format_args!(
+            "Model: {model_name}. Use /model NAME to switch; run qaf models for choices."
+        )),
+        [_, name] if *name == *model_name => {
+            terminal::status(format_args!("Model: {model_name}"));
+        }
+        [_, name] => {
+            let result = tokio::select! {
+                result = model.select_model(name) => result,
+                result = live::cancel() => result,
+                signal = tokio::signal::ctrl_c() => {
+                    signal.context("listen for Ctrl-C")?;
+                    Err(anyhow::anyhow!("interrupted"))
+                }
+            };
+            match result {
+                Ok(()) => {
+                    transcript.record("model_changed", &json!({"from":*model_name,"to":name}))?;
+                    (*name).clone_into(model_name);
+                    if let Some(agent) = agent.as_mut() {
+                        agent.select_model(name);
+                    }
+                    terminal::status(format_args!("Model: {model_name}"));
+                }
+                Err(error) => {
+                    terminal::status(format_args!(
+                        "Could not switch model; still using {model_name}: {error:#}"
+                    ));
+                }
+            }
+        }
+        _ => terminal::status(format_args!("Usage: /model [NAME]")),
+    }
+    Ok(())
+}
+
+// Session-level I/O failures are fatal; task failures allow another prompt.
 async fn task(
     agent: &mut agent::Agent,
     model: &impl model::Model,
@@ -355,30 +381,40 @@ async fn task(
     max_turns: u32,
     approver: &impl permissions::Approver,
 ) -> Result<Result<(), String>> {
+    let _input = live::Task::start(agent.followups())?;
     let mut showing_tools = false;
     let mut rendering = render::Stream::new();
     let mut output_error = None;
     let result = tokio::select! {
+        result = live::collect() => result,
         result = agent.run(model, tools, transcript, max_turns, approver, |event| {
             match event {
                 agent::Event::Text(text) => {
                     match rendering.finish(text) {
-                        Ok(output) => print!("{output}"),
+                        Ok(output) => { if let Err(error) = terminal::output(&output) { output_error = Some(error.into()); } },
                         Err(error) => output_error = Some(error),
                     }
                     showing_tools = false;
                 }
                 agent::Event::Delta(text) => {
-                    print!("{}", rendering.push(text));
+                    if let Err(error) = terminal::output(&rendering.push(text)) { output_error = Some(error.into()); }
                     if let Err(error) = std::io::stdout().flush() { output_error = Some(error.into()); }
                     showing_tools = false;
                 }
                 agent::Event::Search => {
                     if !showing_tools {
-                        eprintln!();
+                        terminal::status(format_args!(""));
                     }
                     terminal::status(format_args!("Searching the web…"));
                     showing_tools = true;
+                }
+                agent::Event::SendingFollowups(count) => {
+                    if count == 1 {
+                        terminal::status(format_args!("\nSending queued follow-up to model…"));
+                    } else {
+                        terminal::status(format_args!("\nSending {count} queued follow-up messages to model…"));
+                    }
+                    showing_tools = false;
                 }
                 agent::Event::Approval => showing_tools = false,
                 agent::Event::Compacted => {
@@ -387,7 +423,7 @@ async fn task(
                 }
                 agent::Event::Tool(tool) => {
                     if !showing_tools {
-                        eprintln!();
+                        terminal::status(format_args!(""));
                     }
                     terminal::status(format_args!("{}", terminal::tool_preview(tool)));
                     showing_tools = true;
@@ -399,7 +435,7 @@ async fn task(
             Err(anyhow::anyhow!("interrupted"))
         }
     };
-    print!("{}", rendering.finish_partial());
+    terminal::output(&rendering.finish_partial())?;
     let result = result.and_then(|()| output_error.map_or(Ok(()), Err));
     match &result {
         Ok(()) => transcript.record("task_finished", &json!({}))?,

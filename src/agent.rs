@@ -6,6 +6,29 @@ use crate::{
 };
 use anyhow::{Result, bail, ensure};
 use serde_json::{Value, json};
+use std::{
+    collections::VecDeque,
+    sync::{Arc, Mutex},
+};
+
+/// Messages submitted during a task, in submission order.
+#[derive(Clone, Default)]
+pub struct Followups(Arc<Mutex<VecDeque<String>>>);
+
+impl Followups {
+    pub fn submit(&self, prompt: String) {
+        if !prompt.trim().is_empty() {
+            self.0
+                .lock()
+                .expect("follow-up queue poisoned")
+                .push_back(prompt);
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.0.lock().expect("follow-up queue poisoned").is_empty()
+    }
+}
 
 pub enum Event<'a> {
     Text(&'a str),
@@ -13,11 +36,14 @@ pub enum Event<'a> {
     Search,
     Approval,
     Compacted,
+    SendingFollowups(usize),
     Tool(&'a crate::tools::Tool),
 }
 
 pub struct Agent {
     history: Vec<Value>,
+    followups: Followups,
+    followups_to_send: usize,
     context: crate::context::Context,
     review_history: crate::review::History,
 }
@@ -29,6 +55,8 @@ impl Agent {
         let mut review_history = crate::review::History::default();
         review_history.push(&json!({"role":"user", "content":prompt}));
         Self {
+            followups: Followups::default(),
+            followups_to_send: 0,
             review_history,
             context: crate::context::Context::default(),
             history: vec![
@@ -36,6 +64,23 @@ impl Agent {
                 json!({"role": "user", "content": prompt}),
             ],
         }
+    }
+
+    pub fn followups(&self) -> Followups {
+        self.followups.clone()
+    }
+
+    pub fn accept_followups(&mut self, transcript: &mut Transcript) -> Result<()> {
+        let queue = self.followups.clone();
+        let mut pending = queue.0.lock().expect("follow-up queue poisoned");
+        while let Some(prompt) = pending.front() {
+            transcript.record("followup", &json!({"role": "user", "content": prompt}))?;
+            self.add_prompt(prompt);
+            self.followups_to_send += 1;
+            pending.pop_front();
+        }
+        drop(pending);
+        Ok(())
     }
 
     pub fn select_model(&mut self, name: &str) {
@@ -136,6 +181,11 @@ impl Agent {
         transcript.record("input", &json!(self.history))?;
         let definitions = Tools::definitions();
         for _ in 0..max_turns {
+            self.accept_followups(transcript)?;
+            let count = std::mem::take(&mut self.followups_to_send);
+            if count > 0 {
+                emit(Event::SendingFollowups(count));
+            }
             let reply = model
                 .respond_stream(&self.history, &definitions, &mut |progress| {
                     match progress {
@@ -164,7 +214,10 @@ impl Agent {
                     !text.is_empty(),
                     "model returned neither text nor tool calls"
                 );
-                return Ok(());
+                if self.followups.is_empty() {
+                    return Ok(());
+                }
+                continue;
             }
             for call in calls {
                 transcript.record("tool_start", &json!({"call_id": call.call_id, "name": call.name, "arguments": call.arguments}))?;
@@ -263,6 +316,110 @@ mod tests {
 
     fn answer() -> Value {
         json!({"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "Fixed and verified."}]})
+    }
+
+    #[tokio::test]
+    async fn queued_messages_follow_tool_results_and_continue_after_final_text() {
+        let dir = tempfile::tempdir().unwrap();
+        let tools = Tools::for_test(dir.path(), Duration::from_secs(1)).unwrap();
+        let mut transcript = Transcript::create(&dir.path().join("log")).unwrap();
+        let model = Scripted::new(vec![
+            vec![
+                json!({"type":"compaction", "encrypted_content":"opaque"}),
+                call("read1", "read_file", &json!({"path":"missing"})),
+                call("read2", "read_file", &json!({"path":"also-missing"})),
+            ],
+            vec![answer()],
+            vec![answer()],
+        ]);
+        let mut agent = Agent::new("Original task", "test");
+        let queue = agent.followups();
+        let mut final_count = 0;
+        let mut queued = false;
+        let mut deliveries = Vec::new();
+        agent
+            .run(
+                &model,
+                &tools,
+                &mut transcript,
+                3,
+                &crate::permissions::Deny,
+                |event| match event {
+                    Event::SendingFollowups(count) => deliveries.push(count),
+                    Event::Tool(_) if !queued => {
+                        queued = true;
+                        queue.submit("First correction".into());
+                        queue.submit("Second correction".into());
+                    }
+                    Event::Text(_) => {
+                        final_count += 1;
+                        if final_count == 1 {
+                            queue.submit("One more thing".into());
+                        }
+                    }
+                    _ => {}
+                },
+            )
+            .await
+            .unwrap();
+        let requests = model.requests.lock().unwrap();
+        assert_eq!(requests.len(), 3);
+        assert_eq!(deliveries, [2, 1]);
+        let second = &requests[1];
+        assert_eq!(second[1]["type"], "compaction");
+        assert_eq!(second[4]["call_id"], "read1");
+        assert_eq!(second[5]["call_id"], "read2");
+        assert_eq!(second[5]["type"], "function_call_output");
+        assert_eq!(second[6]["content"], "First correction");
+        assert_eq!(second[7]["content"], "Second correction");
+        assert_eq!(requests[2].last().unwrap()["content"], "One more thing");
+        let evidence = agent.review_history.snapshot();
+        assert!(
+            evidence
+                .iter()
+                .any(|item| item["content"] == "Second correction")
+        );
+        assert!(queue.is_empty());
+        let log = std::fs::read_to_string(dir.path().join("log")).unwrap();
+        assert_eq!(
+            log.lines()
+                .filter(|line| line.contains("\"kind\":\"followup\""))
+                .count(),
+            3
+        );
+    }
+
+    #[tokio::test]
+    async fn turn_limit_retains_undelivered_followups() {
+        let dir = tempfile::tempdir().unwrap();
+        let tools = Tools::for_test(dir.path(), Duration::from_secs(1)).unwrap();
+        let mut transcript = Transcript::create(&dir.path().join("log")).unwrap();
+        let model = Scripted::new(vec![vec![answer()]]);
+        let mut agent = Agent::new("Original task", "test");
+        let queue = agent.followups();
+        let error = agent
+            .run(
+                &model,
+                &tools,
+                &mut transcript,
+                1,
+                &crate::permissions::Deny,
+                |event| {
+                    if matches!(event, Event::Text(_)) {
+                        queue.submit("Still pending".into());
+                    }
+                },
+            )
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("limit of 1"));
+        assert!(!queue.is_empty());
+        assert!(
+            !agent
+                .history
+                .iter()
+                .any(|item| item["content"] == "Still pending")
+        );
     }
 
     #[tokio::test]

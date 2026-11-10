@@ -30,8 +30,13 @@ In a session, each prompt continues the conversation:
 - `/context` shows approximate context usage.
 - `/model` shows the current model; `/model NAME` switches and remembers it, preserving the conversation.
 - `/exit` or Ctrl-D exits.
-- Ctrl-C stops the current task, or discards input at the prompt.
+- On an interactive terminal, the input area stays at the bottom while responses stream above it. Type and press Enter during a task to queue a follow-up.
+- Follow-ups reach the model in order after the current response and tool batch finish, before its next request. They do not interrupt running tools. A queued follow-up also continues the conversation after a final answer.
+- Ctrl-C stops the current task, or discards input at the prompt. Ctrl-D during a task also stops it when the input is empty.
+- Approval prompts temporarily use the input area and restore your unfinished draft afterward. Session commands such as `/model` and `/clear` are available when the task is idle.
 - Up/Down recall previous inputs.
+
+Queued follow-ups share the current task's `--max-turns` budget. If a task stops with undelivered messages, they are retained for your next prompt; `/clear` discards them. With redirected output or `TERM=dumb`, sessions use the original line prompt and accept input only between tasks.
 
 Responses stream with terminal Markdown formatting; redirected output and `NO_COLOR` use raw Markdown. Conversation and input history last only for the current session; sessions cannot be resumed.
 
@@ -97,3 +102,11 @@ cargo fmt --check
 ```
 
 Tests use scripted model replies and real file/shell tools. They require `rustc`, a POSIX shell, a working OS sandbox, and loopback sockets, but no credentials or internet access. The key in `tests/fixtures` is generated test data.
+
+The optional terminal smoke test checks follow-up input, approval draft restoration, resizing, cancellation, and terminal cleanup using Python 3 and a pseudo-terminal:
+
+```sh
+cargo test --no-run
+# Use the qaf unit-test executable path printed above:
+python3 tests/fixtures/live-terminal.py target/debug/deps/qaf-<hash>
+```

@@ -26,10 +26,13 @@ pub fn status(message: std::fmt::Arguments<'_>) {
     let dim = std::io::stderr().is_terminal()
         && std::env::var_os("NO_COLOR").is_none_or(|value| value.is_empty())
         && std::env::var_os("TERM").is_none_or(|value| value != "dumb");
-    if dim {
-        eprintln!("\x1b[2m{message}\x1b[22m");
+    let text = if dim {
+        format!("\x1b[2m{message}\x1b[22m\n")
     } else {
-        eprintln!("{message}");
+        format!("{message}\n")
+    };
+    if !crate::live::status(&text).unwrap_or(false) {
+        eprint!("{text}");
     }
 }
 
@@ -145,6 +148,9 @@ impl LineEditor {
 
 impl PromptReader for LineEditor {
     async fn read_prompt(&mut self) -> Result<Input> {
+        if crate::live::active() {
+            return crate::live::read(false).await;
+        }
         let mut editor = self
             .editor
             .take()
@@ -318,6 +324,17 @@ pub struct Human;
 impl crate::permissions::Approver for Human {
     async fn approve(&self, request: &serde_json::Value) -> Result<crate::permissions::Decision> {
         use crate::permissions::Decision;
+        if crate::live::active() {
+            let _approval = crate::live::Approval::start()?;
+            let width = terminal_size::terminal_size().map_or(80, |(w, _)| usize::from(w.0));
+            output(&approval_prompt(request, width)?)?;
+            return Ok(match crate::live::read(true).await? {
+                Input::Line(line) if line.trim() == "allow" => Decision::AllowOnce,
+                Input::Line(line) if line.trim() == "cancel" => Decision::Cancel,
+                Input::Interrupted | Input::Eof => Decision::Cancel,
+                Input::Line(_) => Decision::Deny,
+            });
+        }
         let Ok(terminal) = Terminal::open() else {
             eprintln!("Broader access denied: no interactive terminal is available.");
             return Ok(Decision::Deny);
@@ -342,6 +359,31 @@ impl Terminal {
         let file = File::from(std::os::fd::OwnedFd::from(server));
         (Self { file }, client)
     }
+}
+
+/// Keep user text at normal brightness and color only its prefix.
+pub fn user_message(prefix: &str, message: &str) -> String {
+    let colored = std::io::stdout().is_terminal()
+        && std::env::var_os("NO_COLOR").is_none_or(|value| value.is_empty())
+        && std::env::var_os("TERM").is_none_or(|value| value != "dumb");
+    if colored {
+        format!("\x1b[36m{prefix}\x1b[39m {message}\n")
+    } else {
+        format!("{prefix} {message}\n")
+    }
+}
+
+/// Write model output above the live input area when present.
+pub fn output(text: &str) -> std::io::Result<()> {
+    if text.is_empty() {
+        return Ok(());
+    }
+    if !crate::live::output(text)? {
+        let mut stdout = std::io::stdout().lock();
+        stdout.write_all(text.as_bytes())?;
+        stdout.flush()?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]
