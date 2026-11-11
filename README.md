@@ -34,7 +34,8 @@ In a session, each prompt continues the conversation:
 - Follow-ups reach the model in order after the current response and tool batch finish, before its next request. They do not interrupt running tools. A queued follow-up also continues the conversation after a final answer.
 - Ctrl-C stops the current task, or discards input at the prompt. Ctrl-D during a task also stops it when the input is empty.
 - Approval prompts temporarily use the input area and restore your unfinished draft afterward. Session commands such as `/model` and `/clear` are available when the task is idle.
-- Up/Down recall previous inputs.
+- Enter submits; Shift+Enter inserts a newline in terminals that report modified Enter. Alt+Enter or Ctrl-J also insert a newline in the live input. Pasted newlines are preserved.
+- Prompts wrap at word boundaries where possible (splitting overlong words) and show up to six lines; longer drafts keep their full contents, with the visible area following the cursor. Up/Down move between lines and recall history at the edges; Home/End move within the current line.
 
 Queued follow-ups share the current task's `--max-turns` budget. If a task stops with undelivered messages, they are retained for your next prompt; `/clear` discards them. With redirected output or `TERM=dumb`, sessions use the original line prompt and accept input only between tasks.
 

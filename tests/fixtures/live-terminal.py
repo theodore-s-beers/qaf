@@ -62,9 +62,9 @@ try:
     assert b"\x1b[2mSTATUS STYLE PROBE\x1b[22m" in transcript, (
         "live status lost dim styling"
     )
-    os.write(master, b"first\r")
+    os.write(master, b"first\x1b[13;2usecond\r")
     until(b"WORKING")
-    os.write(master, b"follow up\rsaved draft")
+    os.write(master, b"follow up\x1b[13;2umore\rsaved\x1b[13;2udraft")
     until(b"APPROVAL READY")
     # Exercise resizing while the approval owns input.
     fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 30, 100, 0, 0))

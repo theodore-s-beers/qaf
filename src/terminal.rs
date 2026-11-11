@@ -361,16 +361,84 @@ impl Terminal {
     }
 }
 
+/// Shared word-aware wrapping for editable and submitted prompts.
+pub fn wrap_prompt(
+    text: &[char],
+    cursor_index: usize,
+    width: usize,
+) -> (Vec<String>, (usize, usize)) {
+    use unicode_width::UnicodeWidthChar;
+    let width = width.max(1);
+    let mut lines = vec![String::new()];
+    let mut column = 0;
+    let mut cursor = (0, 0);
+    let mut has_word = false;
+    for (index, &c) in text.iter().enumerate() {
+        let visible = if c == '\t' { ' ' } else { c };
+        let size = visible.width().unwrap_or(0);
+        let word_start = !c.is_whitespace() && (index == 0 || text[index - 1].is_whitespace());
+        let word_width = if word_start {
+            text[index..]
+                .iter()
+                .take_while(|c| !c.is_whitespace())
+                .map(|c| c.width().unwrap_or(0))
+                .sum::<usize>()
+        } else {
+            0
+        };
+        // Keep words that fit on a fresh line together; split longer tokens.
+        let move_word = word_start && word_width <= width && column + word_width > width;
+        // Spaces at a soft boundary remain in the actual prompt, but must not
+        // create a whitespace-only display row between two words.
+        let hidden_separator = c != '\n' && c.is_whitespace() && has_word && column + size > width;
+        if move_word || (c != '\n' && column + size > width && !hidden_separator) {
+            lines.push(String::new());
+            column = 0;
+            has_word = false;
+        }
+        if index == cursor_index {
+            cursor = (lines.len() - 1, column);
+        }
+        if c == '\n' {
+            lines.push(String::new());
+            column = 0;
+            has_word = false;
+        } else if !hidden_separator {
+            lines.last_mut().unwrap().push(visible);
+            column += size;
+            has_word |= !c.is_whitespace();
+        }
+    }
+    if cursor_index == text.len() {
+        cursor = (lines.len() - 1, column);
+    }
+    (lines, cursor)
+}
+
 /// Keep user text at normal brightness and color only its prefix.
 pub fn user_message(prefix: &str, message: &str) -> String {
     let colored = std::io::stdout().is_terminal()
         && std::env::var_os("NO_COLOR").is_none_or(|value| value.is_empty())
         && std::env::var_os("TERM").is_none_or(|value| value != "dumb");
-    if colored {
-        format!("\x1b[36m{prefix}\x1b[39m {message}\n")
+    let width = std::io::stdout()
+        .is_terminal()
+        .then(|| terminal_size::terminal_size().map_or(80, |(width, _)| usize::from(width.0)));
+    format_user_message(prefix, message, width, colored)
+}
+
+fn format_user_message(prefix: &str, message: &str, width: Option<usize>, colored: bool) -> String {
+    let label = if colored {
+        format!("\x1b[36m{prefix}\x1b[39m ")
     } else {
-        format!("{prefix} {message}\n")
-    }
+        format!("{prefix} ")
+    };
+    let Some(width) = width else {
+        return format!("{label}{message}\n");
+    };
+    let indent = " ".repeat(textwrap::core::display_width(prefix) + 1);
+    let text: Vec<char> = message.chars().collect();
+    let (lines, _) = wrap_prompt(&text, text.len(), width.saturating_sub(indent.len() + 1));
+    format!("{label}{}\n", lines.join(&format!("\n{indent}")))
 }
 
 /// Write model output above the live input area when present.
@@ -389,6 +457,45 @@ pub fn output(text: &str) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn prompt_wraps_words_and_maps_cursor_at_soft_boundaries() {
+        let text: Vec<char> = "hello world".chars().collect();
+        let original = text.clone();
+        assert_eq!(
+            wrap_prompt(&text, 6, 8),
+            (vec!["hello ".into(), "world".into()], (1, 0))
+        );
+        assert_eq!(wrap_prompt(&text, 8, 8).1, (1, 2));
+        assert_eq!(
+            wrap_prompt(&text, 5, 5),
+            (vec!["hello".into(), "world".into()], (0, 5))
+        );
+        assert_eq!(wrap_prompt(&text, 6, 5).1, (1, 0));
+        assert_eq!(text, original);
+        let text: Vec<char> = "  one  two\n\n界界 end\nabcdefghijk".chars().collect();
+        assert_eq!(
+            wrap_prompt(&text, text.len(), 6).0,
+            ["  one ", "two", "", "界界 ", "end", "abcdef", "ghijk"]
+        );
+    }
+
+    #[test]
+    fn submitted_prompts_indent_wrapped_lines_and_preserve_paragraphs() {
+        let message = "ab界cdef\n\nnext";
+        assert_eq!(
+            format_user_message("qaf>", message, Some(12), false),
+            "qaf> ab界cd\n     ef\n     \n     next\n"
+        );
+        assert_eq!(
+            format_user_message("Queued:", message, Some(15), true),
+            "\x1b[36mQueued:\x1b[39m ab界cd\n        ef\n        \n        next\n"
+        );
+        assert_eq!(
+            format_user_message("qaf>", message, None, false),
+            format!("qaf> {message}\n")
+        );
+    }
 
     #[test]
     fn review_messages_wrap_and_escape_controls_without_quoting() {

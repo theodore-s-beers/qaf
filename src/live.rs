@@ -7,7 +7,6 @@ use std::{
     sync::Mutex,
     time::Duration,
 };
-use unicode_width::UnicodeWidthChar;
 
 static DISPLAY: Mutex<Option<Display>> = Mutex::new(None);
 
@@ -36,6 +35,7 @@ impl Editor {
                     return Some(Input::Interrupted);
                 }
                 KeyCode::Char('d') if self.text.is_empty() => return Some(Input::Eof),
+                KeyCode::Char('j') if history => self.paste("\n"),
                 KeyCode::Char('a') => self.cursor = 0,
                 KeyCode::Char('e') => self.cursor = self.text.len(),
                 KeyCode::Char('u') => {
@@ -57,6 +57,11 @@ impl Editor {
             return None;
         }
         match code {
+            KeyCode::Enter if modifiers.intersects(KeyModifiers::SHIFT | KeyModifiers::ALT) => {
+                if history {
+                    self.paste("\n");
+                }
+            }
             KeyCode::Enter => {
                 let line: String = self.text.drain(..).collect();
                 if history && !line.trim().is_empty() {
@@ -80,8 +85,10 @@ impl Editor {
             }
             KeyCode::Left => self.cursor = self.cursor.saturating_sub(1),
             KeyCode::Right => self.cursor = (self.cursor + 1).min(self.text.len()),
-            KeyCode::Home => self.cursor = 0,
-            KeyCode::End => self.cursor = self.text.len(),
+            KeyCode::Home => self.cursor = self.line_start(),
+            KeyCode::End => self.cursor = self.line_end(),
+            KeyCode::Up if self.move_line(false) => {}
+            KeyCode::Down if self.move_line(true) => {}
             KeyCode::Up if history && !self.history.is_empty() => {
                 if self.recalled.is_none() {
                     self.draft = self.text.iter().collect();
@@ -117,38 +124,66 @@ impl Editor {
         }
     }
 
-    const fn visible(c: char) -> char {
-        match c {
-            '\n' => '↵',
-            '\t' => ' ',
-            _ => c,
-        }
+    fn line_start(&self) -> usize {
+        self.text[..self.cursor]
+            .iter()
+            .rposition(|c| *c == '\n')
+            .map_or(0, |i| i + 1)
     }
 
-    fn viewport(&self, width: usize) -> (String, usize) {
-        let width = width.max(1);
-        let mut start = self.cursor;
-        let mut column = 0;
-        while start > 0 {
-            let size = Self::visible(self.text[start - 1]).width().unwrap_or(0);
-            if column + size >= width {
-                break;
-            }
-            column += size;
-            start -= 1;
-        }
-        let mut used = 0;
-        let visible = self.text[start..]
+    fn line_end(&self) -> usize {
+        self.text[self.cursor..]
             .iter()
-            .copied()
-            .map(Self::visible)
-            .take_while(|c| {
-                used += c.width().unwrap_or(0);
-                used <= width
-            })
-            .collect();
-        (visible, column)
+            .position(|c| *c == '\n')
+            .map_or(self.text.len(), |i| self.cursor + i)
     }
+
+    fn move_line(&mut self, down: bool) -> bool {
+        let start = self.line_start();
+        let column = self.cursor - start;
+        if down {
+            let end = self.line_end();
+            if end == self.text.len() {
+                return false;
+            }
+            let next = end + 1;
+            let length = self.text[next..]
+                .iter()
+                .position(|c| *c == '\n')
+                .unwrap_or(self.text.len() - next);
+            self.cursor = next + column.min(length);
+        } else {
+            if start == 0 {
+                return false;
+            }
+            let previous = self.text[..start - 1]
+                .iter()
+                .rposition(|c| *c == '\n')
+                .map_or(0, |i| i + 1);
+            self.cursor = previous + column.min(start - 1 - previous);
+        }
+        true
+    }
+
+    fn viewport(&self, width: usize, rows: usize) -> Viewport {
+        let (lines, cursor) = crate::terminal::wrap_prompt(&self.text, self.cursor, width);
+        let count = rows.max(1);
+        let start = lines.len().saturating_sub(count).min(cursor.0);
+        let end = (start + count).min(lines.len());
+        Viewport {
+            lines: lines[start..end].to_vec(),
+            row: cursor.0 - start,
+            column: cursor.1,
+            clipped: start > 0,
+        }
+    }
+}
+
+struct Viewport {
+    lines: Vec<String>,
+    row: usize,
+    column: usize,
+    clipped: bool,
 }
 
 /// Status separators share the output stream, including ANSI-styled messages.
@@ -199,16 +234,24 @@ struct Display {
 }
 
 impl Display {
+    fn footer_rows(&self) -> u16 {
+        self.height.saturating_sub(2).clamp(2, 7)
+    }
+
     fn layout(&mut self, width: u16, height: u16, starting: bool) -> io::Result<()> {
         self.width = width.max(1);
         self.height = height.max(3);
         // Changing the scroll region moves the cursor. At startup, restore the
         // output position saved below the existing text instead of jumping down.
-        write!(io::stdout(), "\x1b[r\x1b[1;{}r", self.height - 2)?;
+        write!(
+            io::stdout(),
+            "\x1b[r\x1b[1;{}r",
+            self.height - self.footer_rows()
+        )?;
         if starting {
             write!(io::stdout(), "\x1b8")?;
         } else {
-            write!(io::stdout(), "\x1b[{};1H", self.height - 2)?;
+            write!(io::stdout(), "\x1b[{};1H", self.height - self.footer_rows())?;
         }
         write!(io::stdout(), "\x1b7")?;
         self.draw()
@@ -223,7 +266,10 @@ impl Display {
         };
         let width = usize::from(self.width);
         let label: String = label.chars().take(width.saturating_sub(1)).collect();
-        let (text, cursor) = self.editor.viewport(width.saturating_sub(label.len() + 1));
+        let view = self.editor.viewport(
+            width.saturating_sub(label.len() + 1),
+            usize::from(self.footer_rows() - 1),
+        );
         let hint: String = hint.chars().take(width.saturating_sub(1)).collect();
         let styled = std::env::var_os("NO_COLOR").is_none_or(|value| value.is_empty())
             && std::env::var_os("TERM").is_none_or(|value| value != "dumb");
@@ -234,13 +280,29 @@ impl Display {
             ""
         };
         let mut out = io::stdout().lock();
+        let top = self.height - self.footer_rows() + 1;
+        write!(out, "{reset}\x1b[{top};1H\x1b[J{hint}")?;
+        let first = self.height - u16::try_from(view.lines.len()).unwrap() + 1;
+        for (index, text) in view.lines.iter().enumerate() {
+            let row = first + u16::try_from(index).unwrap();
+            let prefix = if index == 0 {
+                label.clone()
+            } else {
+                " ".repeat(label.len())
+            };
+            // An ellipsis marks earlier lines hidden by the bounded viewport.
+            let prefix = if index == 0 && view.clipped {
+                format!("…{}", " ".repeat(label.len().saturating_sub(1)))
+            } else {
+                prefix
+            };
+            write!(out, "\x1b[{row};1H{color}{prefix}{reset}{text}")?;
+        }
         write!(
             out,
-            "{reset}\x1b[{};1H\x1b[2K{hint}\x1b[{};1H\x1b[2K{color}{label}{reset}{text}\x1b[{};{}H",
-            self.height - 1,
-            self.height,
-            self.height,
-            (label.len() + cursor + 1).min(width)
+            "\x1b[{};{}H",
+            first + u16::try_from(view.row).unwrap(),
+            (label.len() + view.column + 1).min(width)
         )?;
         out.flush()
     }
@@ -322,7 +384,13 @@ impl Session {
         }
         crossterm::terminal::enable_raw_mode()?;
         let session = Self;
-        crossterm::execute!(io::stdout(), event::EnableBracketedPaste)?;
+        crossterm::execute!(
+            io::stdout(),
+            event::EnableBracketedPaste,
+            event::PushKeyboardEnhancementFlags(
+                event::KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
+            )
+        )?;
         let mut display = Display {
             editor: Editor::default(),
             spacing: Spacing::default(),
@@ -332,7 +400,12 @@ impl Session {
             approval: false,
         };
         // Reserve the input rows without overwriting the latest shell/startup output.
-        write!(io::stdout(), "\r\n\r\n\x1b[2A\x1b7")?;
+        let reserved = display.footer_rows();
+        write!(
+            io::stdout(),
+            "{}\x1b[{reserved}A\x1b7",
+            "\r\n".repeat(usize::from(reserved))
+        )?;
         display.layout(width, height, true)?;
         *DISPLAY.lock().expect("display poisoned") = Some(display);
         Ok(Some(session))
@@ -342,9 +415,17 @@ impl Drop for Session {
     fn drop(&mut self) {
         let display = DISPLAY.lock().ok().and_then(|mut display| display.take());
         if let Some(display) = display {
-            let _ = write!(io::stdout(), "\x1b[r\x1b[{};1H\x1b[J", display.height - 1);
+            let _ = write!(
+                io::stdout(),
+                "\x1b[r\x1b[{};1H\x1b[J",
+                display.height - display.footer_rows() + 1
+            );
         }
-        let _ = crossterm::execute!(io::stdout(), event::DisableBracketedPaste);
+        let _ = crossterm::execute!(
+            io::stdout(),
+            event::PopKeyboardEnhancementFlags,
+            event::DisableBracketedPaste
+        );
         let _ = crossterm::terminal::disable_raw_mode();
     }
 }
@@ -539,16 +620,30 @@ mod tests {
     }
 
     #[test]
-    fn editor_keeps_unicode_cursor_visible_in_narrow_viewports() {
+    fn multiline_editing_wraps_and_keeps_full_prompt_when_clipped() {
         let mut editor = Editor::default();
-        editor.paste("a界bc");
-        assert_eq!(editor.viewport(4), ("bc".into(), 2));
-        editor.key(KeyCode::Left, KeyModifiers::NONE, true);
-        editor.key(KeyCode::Backspace, KeyModifiers::NONE, true);
-        assert_eq!(editor.text.iter().collect::<String>(), "a界c");
-        assert_eq!(editor.viewport(4), ("a界c".into(), 3));
-        editor.key(KeyCode::Home, KeyModifiers::NONE, true);
-        assert_eq!(editor.viewport(1), ("a".into(), 0));
+        editor.paste("first");
+        assert!(
+            editor
+                .key(KeyCode::Enter, KeyModifiers::SHIFT, true)
+                .is_none()
+        );
+        editor.paste("second");
+        let view = editor.viewport(4, 2);
+        assert_eq!(view.lines, ["seco", "nd"]);
+        assert!(view.clipped);
+        assert_eq!((view.row, view.column), (1, 2));
+        editor.key(KeyCode::Up, KeyModifiers::NONE, true);
+        assert_eq!(editor.cursor, 5);
+        editor.key(KeyCode::Down, KeyModifiers::NONE, true);
+        editor.key(KeyCode::End, KeyModifiers::NONE, true);
+        assert!(
+            matches!(editor.key(KeyCode::Enter, KeyModifiers::NONE, true), Some(Input::Line(text)) if text == "first\nsecond")
+        );
+        editor.paste("a界bc\nlast\n");
+        let view = editor.viewport(4, 6);
+        assert_eq!(view.lines, ["a界b", "c", "last", ""]);
+        assert_eq!((view.row, view.column), (3, 0));
     }
 
     // Driven by tests/fixtures/live-terminal.py in a real pseudo-terminal.
@@ -561,7 +656,7 @@ mod tests {
         let Input::Line(line) = read(false).await.unwrap() else {
             panic!("expected input");
         };
-        assert_eq!(line, "first");
+        assert_eq!(line, "first\nsecond");
         let queue = Followups::default();
         let task = Task::start(queue.clone()).unwrap();
         output("WORKING\n").unwrap();
@@ -579,7 +674,7 @@ mod tests {
             assert!(matches!(read(true).await.unwrap(), Input::Line(line) if line == "deny"));
         }
         output("DRAFT RESTORED\n").unwrap();
-        assert!(matches!(read(false).await.unwrap(), Input::Line(line) if line == "saved draft"));
+        assert!(matches!(read(false).await.unwrap(), Input::Line(line) if line == "saved\ndraft"));
         output("CANCEL READY\n").unwrap();
         assert!(
             collect()
