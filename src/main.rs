@@ -142,7 +142,9 @@ async fn run() -> Result<()> {
     show_models(&model_name, &primary_settings, reviewer, &reviewer_settings);
     terminal::status(format_args!("Transcript: {}", path.display()));
     if let Some(prompt) = args.prompt {
-        let mut agent = agent::Agent::new(&prompt, &model_name);
+        let instructions = load_instructions(&config_directory.join("AGENTS.md"))?;
+        let mut agent =
+            agent::Agent::new(&prompt, &model_name).with_instructions(instructions.as_deref());
         task(
             &mut agent,
             &model,
@@ -160,8 +162,11 @@ async fn run() -> Result<()> {
             &model,
             &tools,
             &mut transcript,
-            args.max_turns,
-            &model_name,
+            SessionConfig {
+                max_turns: args.max_turns,
+                model_name: &model_name,
+                instructions_path: config_directory.join("AGENTS.md"),
+            },
             &approver,
         )
         .await?;
@@ -244,19 +249,40 @@ async fn run_command(
     }
 }
 
+fn load_instructions(path: &std::path::Path) -> Result<Option<String>> {
+    let content = match std::fs::read_to_string(path) {
+        Ok(content) => content,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error).with_context(|| format!("read {}", path.display())),
+    };
+    Ok((!content.trim().is_empty()).then(|| {
+        format!(
+            "# User instructions from {}\n<INSTRUCTIONS>\n{content}\n</INSTRUCTIONS>",
+            path.display()
+        )
+    }))
+}
+
+struct SessionConfig<'a> {
+    max_turns: u32,
+    model_name: &'a str,
+    instructions_path: PathBuf,
+}
+
 async fn interactive(
     terminal: &mut impl terminal::PromptReader,
     model: &impl model::Model,
     tools: &tools::Tools,
     transcript: &mut transcript::Transcript,
-    max_turns: u32,
-    model_name: &str,
+    config: SessionConfig<'_>,
     approver: &impl permissions::Approver,
 ) -> Result<()> {
     terminal::status(format_args!(
         "/model switches models; /context shows usage; /clear starts fresh; /exit or Ctrl-D exits; Ctrl-C stops the current task."
     ));
-    let mut model_name = model_name.to_owned();
+    let mut model_name = config.model_name.to_owned();
+    let max_turns = config.max_turns;
+    let mut instructions = load_instructions(&config.instructions_path)?;
     let mut agent: Option<agent::Agent> = None;
     loop {
         terminal::status(format_args!(""));
@@ -286,6 +312,7 @@ async fn interactive(
                 continue;
             }
             "/clear" => {
+                instructions = load_instructions(&config.instructions_path)?;
                 agent = None;
                 transcript.record("clear", &json!({}))?;
                 terminal::status(format_args!(
@@ -305,7 +332,9 @@ async fn interactive(
             agent.accept_followups(transcript)?;
             agent.add_prompt(prompt);
         }
-        let agent = agent.get_or_insert_with(|| agent::Agent::new(prompt, &model_name));
+        let agent = agent.get_or_insert_with(|| {
+            agent::Agent::new(prompt, &model_name).with_instructions(instructions.as_deref())
+        });
         if let Err(error) = task(agent, model, tools, transcript, max_turns, approver).await? {
             terminal::status(format_args!(
                 "Task stopped: {error}\nYou can continue with another prompt, or /clear to start fresh."
@@ -489,44 +518,86 @@ mod tests {
             })
         }
     }
-    struct Prompts(VecDeque<terminal::Input>);
+    struct Prompts(VecDeque<terminal::Input>, PathBuf);
     impl terminal::PromptReader for Prompts {
         fn read_prompt(
             &mut self,
         ) -> impl std::future::Future<Output = Result<terminal::Input>> + Send {
-            std::future::ready(Ok(self.0.pop_front().unwrap_or(terminal::Input::Eof)))
+            let input = self.0.pop_front().unwrap_or(terminal::Input::Eof);
+            if matches!(&input, terminal::Input::Line(line) if line == "/clear") {
+                // Simulate editing personal instructions during the session.
+                std::fs::write(&self.1, "Ask before committing.").unwrap();
+            }
+            std::future::ready(Ok(input))
         }
+    }
+
+    #[test]
+    fn user_instructions_follow_symlinks_and_report_read_errors() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("AGENTS.md");
+        assert!(load_instructions(&path).unwrap().is_none());
+        let target = root.path().join("shared.md");
+        std::fs::write(&target, "Use jj.").unwrap();
+        std::os::unix::fs::symlink(&target, &path).unwrap();
+        let loaded = load_instructions(&path).unwrap().unwrap();
+        assert!(loaded.contains(path.to_str().unwrap()));
+        assert!(loaded.contains("Use jj."));
+        std::fs::write(&target, "Updated instructions.").unwrap();
+        assert!(
+            load_instructions(&path)
+                .unwrap()
+                .unwrap()
+                .contains("Updated instructions.")
+        );
+        std::fs::write(&target, " \n").unwrap();
+        assert!(load_instructions(&path).unwrap().is_none());
+        std::fs::remove_file(&target).unwrap();
+        std::fs::create_dir(&target).unwrap();
+        assert!(
+            load_instructions(&path)
+                .unwrap_err()
+                .to_string()
+                .contains("AGENTS.md")
+        );
     }
 
     #[tokio::test]
     async fn session_continues_after_errors_and_clear_resets_context() {
         let root = tempfile::tempdir().unwrap();
         let tools = tools::Tools::for_test(root.path(), Duration::from_secs(1)).unwrap();
+        std::fs::write(root.path().join("AGENTS.md"), "Use jj.").unwrap();
         let path = root.path().join("log");
         let mut transcript = transcript::Transcript::create(&path).unwrap();
         let model = Model(Mutex::new(Vec::new()), Mutex::new("session-model".into()));
-        let mut terminal = Prompts(VecDeque::from([
-            terminal::Input::Line("/context".into()),
-            terminal::Input::Interrupted,
-            terminal::Input::Line("first".into()),
-            terminal::Input::Line("/model".into()),
-            terminal::Input::Line("/model new-model".into()),
-            terminal::Input::Line("/model missing".into()),
-            terminal::Input::Line("/model too many args".into()),
-            terminal::Input::Line("/context".into()),
-            terminal::Input::Interrupted,
-            terminal::Input::Line("followup".into()),
-            terminal::Input::Line("/clear".into()),
-            terminal::Input::Line("third".into()),
-            terminal::Input::Line("/exit".into()),
-        ]));
+        let mut terminal = Prompts(
+            VecDeque::from([
+                terminal::Input::Line("/context".into()),
+                terminal::Input::Interrupted,
+                terminal::Input::Line("first".into()),
+                terminal::Input::Line("/model".into()),
+                terminal::Input::Line("/model new-model".into()),
+                terminal::Input::Line("/model missing".into()),
+                terminal::Input::Line("/model too many args".into()),
+                terminal::Input::Line("/context".into()),
+                terminal::Input::Interrupted,
+                terminal::Input::Line("followup".into()),
+                terminal::Input::Line("/clear".into()),
+                terminal::Input::Line("third".into()),
+                terminal::Input::Line("/exit".into()),
+            ]),
+            root.path().join("AGENTS.md"),
+        );
         interactive(
             &mut terminal,
             &model,
             &tools,
             &mut transcript,
-            1,
-            "session-model",
+            SessionConfig {
+                max_turns: 1,
+                model_name: "session-model",
+                instructions_path: root.path().join("AGENTS.md"),
+            },
             &terminal::Human,
         )
         .await
@@ -542,12 +613,23 @@ mod tests {
                 "`new-model`"
             }));
             assert!(!instructions.contains("{{REQUESTED_MODEL}}"));
+            assert_eq!(input[1]["role"], "user");
+            assert!(
+                input[1]["content"]
+                    .as_str()
+                    .unwrap()
+                    .contains(if index < 2 {
+                        "Use jj."
+                    } else {
+                        "Ask before committing."
+                    })
+            );
         }
-        assert_eq!(inputs[1][1]["content"], "first");
-        assert_eq!(inputs[1][2]["role"], "assistant");
-        assert_eq!(inputs[1][3]["content"], "followup");
-        assert_eq!(inputs[2].len(), 2);
-        assert_eq!(inputs[2][1]["content"], "third");
+        assert_eq!(inputs[1][2]["content"], "first");
+        assert_eq!(inputs[1][3]["role"], "assistant");
+        assert_eq!(inputs[1][4]["content"], "followup");
+        assert_eq!(inputs[2].len(), 3);
+        assert_eq!(inputs[2][2]["content"], "third");
         drop(inputs);
         let records: Vec<serde_json::Value> = std::fs::read_to_string(path)
             .unwrap()

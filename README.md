@@ -49,6 +49,8 @@ Context usage appears after each task; long conversations are compacted automati
 
 Credentials and `preferences.json` live in `~/.config/qaf` (or `$XDG_CONFIG_HOME/qaf`); override this with `--auth-dir`. Use `qaf status` to view accounts, `qaf logout` to sign out, and `--account LABEL` to select an account.
 
+Place personal instructions in `AGENTS.md` in the same configuration directory. qaf loads it at session startup and on `/clear`, and retains it through compaction. Symlinks are supported, so you can share a file with another harness. Missing or empty files are ignored; other read errors are reported.
+
 Model selection order is `--model`, `OPENAI_MODEL`, then the saved preference. Explicit selections are remembered. For example, `preferences.json` can contain:
 
 ```json

@@ -42,6 +42,7 @@ pub enum Event<'a> {
 
 pub struct Agent {
     history: Vec<Value>,
+    instruction_count: usize,
     followups: Followups,
     followups_to_send: usize,
     context: crate::context::Context,
@@ -55,6 +56,7 @@ impl Agent {
         let mut review_history = crate::review::History::default();
         review_history.push(&json!({"role":"user", "content":prompt}));
         Self {
+            instruction_count: 1,
             followups: Followups::default(),
             followups_to_send: 0,
             review_history,
@@ -64,6 +66,19 @@ impl Agent {
                 json!({"role": "user", "content": prompt}),
             ],
         }
+    }
+
+    pub fn with_instructions(mut self, instructions: Option<&str>) -> Self {
+        if let Some(instructions) = instructions {
+            self.history
+                .insert(1, json!({"role":"user", "content":instructions}));
+            self.instruction_count = 2;
+            self.review_history = crate::review::History::default();
+            for item in &self.history {
+                self.review_history.push(item);
+            }
+        }
+        self
     }
 
     pub fn followups(&self) -> Followups {
@@ -145,7 +160,7 @@ impl Agent {
             );
             transcript.record(
                 "compaction",
-                &json!({"discarded_items":self.history.len() - 1 + index}),
+                &json!({"discarded_items":self.history.len() - self.instruction_count + index}),
             )?;
         }
         if let Some(usage) = &reply.usage {
@@ -155,9 +170,9 @@ impl Agent {
             self.review_history.push(item);
         }
         if let Some(index) = boundary {
-            // Keep trusted harness instructions explicit; the encrypted item carries
+            // Keep harness and user configuration instructions explicit; the encrypted item carries
             // earlier conversation state. Preserve all items after that boundary.
-            self.history.truncate(1);
+            self.history.truncate(self.instruction_count);
             self.history.extend(reply.output.into_iter().skip(index));
             self.context.compacted();
             emit(Event::Compacted);
@@ -438,7 +453,9 @@ mod tests {
             input_tokens: 240_000,
             output_tokens: 100,
         });
-        let mut agent = Agent::new("Original task", "test-model");
+        let mut agent = Agent::new("Original task", "test-model")
+            .with_instructions(Some("Always ask before deleting files."));
+        let user_instructions = agent.history[1].clone();
         let instructions = agent.history[0].clone();
         let mut compactions = 0;
         agent
@@ -457,9 +474,13 @@ mod tests {
             .await
             .unwrap();
         let requests = model.requests.lock().unwrap();
-        assert_eq!(&requests[1][..3], &[instructions, compact, new_call]);
-        assert_eq!(requests[1][3]["type"], "function_call_output");
-        assert_eq!(requests[1][3]["call_id"], "new");
+        assert_eq!(
+            &requests[1][..4],
+            &[instructions, user_instructions.clone(), compact, new_call]
+        );
+        assert_eq!(agent.review_history.snapshot()[0], user_instructions);
+        assert_eq!(requests[1][4]["type"], "function_call_output");
+        assert_eq!(requests[1][4]["call_id"], "new");
         assert_eq!(compactions, 1);
         assert!(agent.context_tokens() < crate::context::COMPACT_AT);
         assert!(
