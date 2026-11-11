@@ -558,39 +558,26 @@ mod tests {
     }
 
     #[test]
-    fn streaming_waits_for_the_whole_table() {
-        let mut stream = Stream::new();
-        stream.styled = true;
-        for chunk in [
-            "| Issue | Title |\n",
-            "|---|---|\n",
-            "| 1 | short |\n",
-            "| 2 | much longer title |\n\n",
-        ] {
-            assert_eq!(stream.push(chunk), "");
-        }
-        assert_ne!(stream.push("After the table\n"), "");
-        assert!(stream.source[..stream.emitted].contains("much longer title"));
-        assert_eq!(stream.finish_partial().trim(), "After the table");
-    }
-
-    #[test]
     fn streaming_partial_table_rows_match_complete_rendering() {
         let source = "Intro.\n\n| Issue | Title |\n|---|---|\n| #12 | `alpha` |\n| #345 | **longer title** |\n\nAfter.\n";
+        let table_start = source.find("| Issue").unwrap();
+        let table_end = source.find("After.").unwrap();
         for chunk_size in [1, 2, 3, 7, source.len()] {
             let mut stream = Stream::new();
             stream.styled = true;
             let mut output = String::new();
             for chunk in source.as_bytes().chunks(chunk_size) {
                 output.push_str(&stream.push(std::str::from_utf8(chunk).unwrap()));
-                let table_start = source.find("| Issue").unwrap();
-                let table_end = source.find("After.").unwrap();
                 assert!(
                     stream.emitted <= table_start || stream.emitted >= table_end,
                     "emitted part of the table at byte {} with chunk size {chunk_size}",
                     stream.emitted
                 );
             }
+            assert!(
+                stream.emitted >= table_end,
+                "completed table stayed buffered"
+            );
             output.push_str(&stream.finish(source).unwrap());
             assert_eq!(output.trim(), markdown(source, super::terminal_width()));
         }

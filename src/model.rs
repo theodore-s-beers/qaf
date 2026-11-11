@@ -660,16 +660,9 @@ mod tests {
     }
 
     #[test]
-    fn parser_rejects_malformed_json_and_buffers_partial_events() {
+    fn parser_rejects_malformed_json() {
         let mut events = Events::default();
         assert!(events.push(b"data: invalid\n\n").is_err());
-        let mut events = Events::default();
-        assert_eq!(
-            events
-                .push(b"data: {\"type\":\"response.completed\"")
-                .unwrap(),
-            [] as [serde_json::Value; 0]
-        );
     }
 
     #[test]

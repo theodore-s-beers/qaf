@@ -461,7 +461,6 @@ mod tests {
     #[test]
     fn prompt_wraps_words_and_maps_cursor_at_soft_boundaries() {
         let text: Vec<char> = "hello world".chars().collect();
-        let original = text.clone();
         assert_eq!(
             wrap_prompt(&text, 6, 8),
             (vec!["hello ".into(), "world".into()], (1, 0))
@@ -472,7 +471,6 @@ mod tests {
             (vec!["hello".into(), "world".into()], (0, 5))
         );
         assert_eq!(wrap_prompt(&text, 6, 5).1, (1, 0));
-        assert_eq!(text, original);
         let text: Vec<char> = "  one  two\n\n界界 end\nabcdefghijk".chars().collect();
         assert_eq!(
             wrap_prompt(&text, text.len(), 6).0,

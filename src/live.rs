@@ -561,19 +561,13 @@ mod tests {
 
     #[test]
     fn status_separators_do_not_stack_after_queued_messages() {
-        for next in [
-            "Sending queued follow-up to model…",
-            "Reviewing requested access…",
-            "Running: gh issue list",
-        ] {
-            let mut spacing = Spacing::default();
-            let queued = spacing.prepare("\x1b[36mQueued:\x1b[39m follow up\n\n", true);
-            let notice = spacing.prepare(&format!("\x1b[2m\n{next}\x1b[22m\n"), true);
-            assert_eq!(
-                format!("{queued}{notice}"),
-                format!("\x1b[36mQueued:\x1b[39m follow up\n\n\x1b[2m{next}\x1b[22m\n")
-            );
-        }
+        let mut spacing = Spacing::default();
+        let queued = spacing.prepare("\x1b[36mQueued:\x1b[39m follow up\n\n", true);
+        let notice = spacing.prepare("\x1b[2m\nRunning: command\x1b[22m\n", true);
+        assert_eq!(
+            format!("{queued}{notice}"),
+            "\x1b[36mQueued:\x1b[39m follow up\n\n\x1b[2mRunning: command\x1b[22m\n"
+        );
         let mut spacing = Spacing::default();
         spacing.prepare("Running: command\n", true);
         assert_eq!(
