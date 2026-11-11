@@ -31,6 +31,7 @@ In a session, each prompt continues the conversation:
 - `/model` shows the current model; `/model NAME` switches and remembers it, preserving the conversation.
 - `/exit` or Ctrl-D exits.
 - On an interactive terminal, the input area stays at the bottom while responses stream above it. Type and press Enter during a task to queue a follow-up.
+- The live prompt is cyan when idle and orange while a task is running and submitted messages will be queued. Colors are disabled with `NO_COLOR`.
 - Follow-ups reach the model in order after the current response and tool batch finish, before its next request. They do not interrupt running tools. A queued follow-up also continues the conversation after a final answer.
 - Ctrl-C stops the current task, or discards input at the prompt. Ctrl-D during a task also stops it when the input is empty.
 - Approval prompts temporarily use the input area and restore your unfinished draft afterward. Session commands such as `/model` and `/clear` are available when the task is idle.

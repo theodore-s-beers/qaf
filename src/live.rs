@@ -275,7 +275,11 @@ impl Display {
             && std::env::var_os("TERM").is_none_or(|value| value != "dumb");
         let reset = if styled { "\x1b[0m" } else { "" };
         let color = if styled && !self.approval {
-            "\x1b[36m"
+            if self.queue.is_some() {
+                "\x1b[38;5;208m"
+            } else {
+                "\x1b[36m"
+            }
         } else {
             ""
         };
